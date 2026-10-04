@@ -1,0 +1,378 @@
+#!/usr/bin/env python3
+"""wlan-vergleich – fairer A/B-Test: Wi-Fi 6E gegen Wi-Fi 7 auf diesem PC.
+
+Ablauf (ca. 6 Minuten, Modus wird automatisch umgeschaltet):
+  A, B, A, B – je Durchgang:
+    30 s Ping zum Router (40/s, wie ein Spiel)      -> Verlust, Jitter, Lag-Spitzen
+    12 s Download vom Server (per Kabel) (+ Ping dabei)  -> Geschwindigkeit, Ping unter Last
+    12 s Upload zum Server (per Kabel) (+ Ping dabei)
+    dazu Router-Zaehler                              -> Wiederholungen / verlorene Pakete
+Am Ende: Vergleichstabelle, Empfehlung, Auswahl welcher Modus bleiben soll.
+"""
+import argparse, json, os, re, socket, statistics, subprocess, sys, threading, time
+
+# Einstellungen aus ~/.config/wlan-tools/config (siehe config.example); ohne Datei: Standard-Gateway
+def _cfg():
+    c = {}
+    try:
+        for line in open(os.path.expanduser("~/.config/wlan-tools/config")):
+            k, _, v = line.strip().partition("=")
+            if k and not k.startswith("#"):
+                c[k.strip()] = v.strip().strip("\"'")
+    except OSError:
+        pass
+    if not c.get("ROUTER_HOST"):
+        r = subprocess.run(["ip", "-4", "route", "show", "default"], capture_output=True, text=True).stdout.split()
+        c["ROUTER_HOST"] = r[r.index("via") + 1] if "via" in r else "192.168.1.1"
+    return c
+
+
+CFG = _cfg()
+ROUTER_IP = CFG["ROUTER_HOST"]
+ROUTER_LOGIN = f"{CFG.get('ROUTER_USER', 'admin')}@{ROUTER_IP}"
+ROUTER_PORT = CFG.get("ROUTER_PORT", "22")
+
+PVE = CFG.get("SERVER", "")          # z. B. root@192.168.1.10 – Linux-Rechner per Kabel, mit python3
+PVE_IP = PVE.split("@")[-1]
+PORT = 5299
+CONF = "/etc/modprobe.d/iwlwifi-disable-eht.conf"
+OUTDIR = os.path.expanduser("~/.local/state/wlan-vergleich")
+SSH_R = ["ssh", "-q", "-p", ROUTER_PORT, "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", ROUTER_LOGIN]
+SSH_P = ["ssh", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", PVE]
+
+ESC = "\033["
+RST, BLD, DIM = ESC + "0m", ESC + "1m", ESC + "2m"
+RED, GRN, YEL, CYN = ESC + "31m", ESC + "32m", ESC + "33m", ESC + "36m"
+
+SERVER = r'''
+import socket, threading
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", %d)); s.listen(16)
+buf = b"\0" * 262144
+def h(c):
+    try:
+        if c.recv(1) == b"D":
+            while True: c.sendall(buf)
+        else:
+            while c.recv(262144): pass
+    except Exception: pass
+    finally: c.close()
+while True:
+    c, _ = s.accept(); threading.Thread(target=h, args=(c,), daemon=True).start()
+''' % PORT
+
+ENV = dict(os.environ)
+ENV.setdefault("SSH_AUTH_SOCK", f"{os.environ.get('XDG_RUNTIME_DIR')}/gcr/ssh")
+IFACE = MAC = None
+
+
+def say(msg, end="\n"):
+    print("  " + msg, end=end, flush=True)
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, env=ENV, **kw)
+
+
+# ---------------------------------------------------------------- Modus
+def mode_label(eht):
+    return "Wi-Fi 7" if eht else "Wi-Fi 6E"
+
+
+def current_eht():
+    try:
+        return open("/sys/module/iwlwifi/parameters/disable_11be").read().strip() == "N"
+    except OSError:
+        return False
+
+
+def link_info():
+    info = run(["iw", "dev", IFACE, "info"]).stdout
+    sd = run(["iw", "dev", IFACE, "station", "dump"]).stdout
+    w = re.search(r"width: (\d+) MHz", info)
+    s = re.search(r"^\s*signal:\s*(-?\d+)", sd, re.M)
+    r = re.search(r"rx bitrate:\s*([\d.]+) MBit/s.*?(EHT|HE)-MCS (\d+).*?NSS (\d)", sd)
+    return {"width": int(w.group(1)) if w else 0, "signal": int(s.group(1)) if s else None,
+            "phy_rx": float(r.group(1)) if r else None, "std": r.group(2) if r else "?",
+            "mcs": int(r.group(3)) if r else None, "nss": int(r.group(4)) if r else None}
+
+
+def set_mode(eht):
+    if current_eht() == eht and run(["ping", "-c1", "-W1", ROUTER_IP]).returncode == 0:
+        return True
+    say(f"Schalte auf {BLD}{mode_label(eht)}{RST} um (WLAN kurz weg) …", end="")
+    r = subprocess.run(["sudo", "sh", "-c", "modprobe -r iwlmld iwlwifi && modprobe iwlwifi disable_11be=" + ("N" if eht else "Y")],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f" {RED}Fehler: {r.stderr.strip()}{RST}")
+        return False
+    for _ in range(90):
+        time.sleep(1)
+        if "Connected" in run(["iw", "dev", IFACE, "link"]).stdout and \
+           run(["ping", "-c1", "-W1", ROUTER_IP]).returncode == 0:
+            print(f" {GRN}verbunden{RST}")
+            return True
+    print(f" {RED}keine Verbindung nach 90 s{RST}")
+    return False
+
+
+def warmup():
+    say(f"{DIM}Aufwärmen 10 s (Router lernt die beste Rate) …{RST}")
+    run(["ping", "-q", "-i", "0.02", "-s", "1400", "-c", "500", ROUTER_IP])
+
+
+# ---------------------------------------------------------------- Messungen
+def router_counters():
+    script = (f"for d in /sys/class/net/ath*; do i=${{d##*/}}; wlanconfig $i list sta 2>/dev/null | grep -qi '^{MAC}' && "
+              f"{{ apstats -v -i $i -R | awk 'tolower($0) ~ /node level stats: {MAC}/ {{on=1; next}} /Node Level Stats/ {{on=0}} on'; break; }}; done")
+    out = run(SSH_R + [script], timeout=30).stdout
+    c = {}
+    for line in out.splitlines():
+        k, sep, v = line.partition("=")
+        if sep:
+            try:
+                c[k.strip()] = int(v.strip())
+            except ValueError:
+                pass
+    return c
+
+
+class Pinger:
+    def __init__(self, interval=0.025):
+        self.rtts, self.sent = [], 0
+        self.p = subprocess.Popen(["ping", "-n", "-i", str(interval), "-W", "1", ROUTER_IP],
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        self.seqs = set()
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self):
+        for line in self.p.stdout:
+            m = re.search(r"icmp_seq=(\d+).*time=([\d.]+)", line)
+            if m:
+                self.seqs.add(int(m.group(1)))
+                self.rtts.append(float(m.group(2)))
+
+    def stop(self):
+        time.sleep(1.2)                       # letzte Antworten abwarten
+        self.p.terminate()
+        self.p.wait()
+        sent = max(self.seqs) if self.seqs else 0
+        r = sorted(self.rtts)
+        if not r:
+            return {"loss": 100.0}
+        med = statistics.median(r)
+        return {"loss": max(0.0, (sent - len(r)) / sent * 100) if sent else 0.0,
+                "avg": statistics.mean(r), "p99": r[min(len(r) - 1, int(len(r) * 0.99))],
+                "max": r[-1], "jitter": statistics.mean(abs(a - b) for a, b in zip(self.rtts, self.rtts[1:])) if len(r) > 2 else 0,
+                "spikes": sum(1 for x in r if x > med + 30), "n": sent}
+
+
+def latency(sec):
+    p = Pinger()
+    time.sleep(sec)
+    return p.stop()
+
+
+def throughput(direction, sec=12, streams=4):
+    srv = subprocess.Popen(SSH_P + [f"timeout {sec + 20} python3 -"], stdin=subprocess.PIPE,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True, env=ENV)
+    srv.stdin.write(SERVER)
+    srv.stdin.close()
+    for _ in range(50):
+        try:
+            socket.create_connection((PVE_IP, PORT), timeout=0.5).close()
+            break
+        except OSError:
+            time.sleep(0.2)
+    else:
+        srv.kill()
+        return None, None
+    counts = [0] * streams
+    t0 = time.time()
+    start, end = t0 + 2, t0 + sec               # 2 s Anlauf nicht mitzaehlen
+    buf = b"\0" * 262144
+
+    def worker(i):
+        try:
+            s = socket.create_connection((PVE_IP, PORT), timeout=5)
+            s.sendall(b"D" if direction == "down" else b"U")
+            while time.time() < end:
+                n = len(s.recv(262144)) if direction == "down" else s.send(buf)
+                if time.time() >= start:
+                    counts[i] += n
+            s.close()
+        except OSError:
+            pass
+
+    th = [threading.Thread(target=worker, args=(i,)) for i in range(streams)]
+    for t in th:
+        t.start()
+    time.sleep(2)
+    p = Pinger()                                 # Ping unter Last
+    for t in th:
+        t.join()
+    lat = p.stop()
+    srv.kill()
+    return sum(counts) * 8 / (end - start) / 1e6, lat
+
+
+def one_run(eht, idx):
+    li = link_info()
+    say(f"{BLD}Durchgang {idx}: {mode_label(eht)}{RST}  {DIM}({li['std']} · {li['width']} MHz · Signal {li['signal']} dBm · "
+        f"MCS {li['mcs']} · {li['nss']} Ströme){RST}")
+    c0 = router_counters()
+    say("  Ping-Test 30 s …", end="")
+    lat = latency(30)
+    print(f" Verlust {lat['loss']:.2f}% · Ø {lat.get('avg', 0):.1f} ms · Jitter {lat.get('jitter', 0):.1f} ms · Lags {lat.get('spikes', 0)}")
+    say("  Download 12 s …", end="")
+    down, dl = throughput("down")
+    print(f" {down:.0f} Mbit/s · Ping dabei p99 {dl['p99']:.0f} ms" if down else f" {RED}Server nicht erreichbar{RST}")
+    say("  Upload 12 s …", end="")
+    up, ul = throughput("up")
+    print(f" {up:.0f} Mbit/s · Ping dabei p99 {ul['p99']:.0f} ms" if up else f" {RED}Server nicht erreichbar{RST}")
+    c1 = router_counters()
+    d = {k: c1.get(k, 0) - c0.get(k, 0) for k in c1}
+    tried = d.get("Tx mpdu tried count", 0)
+    rx = d.get("Rx mpdu count", 0)
+    res = {
+        "mode": mode_label(eht), "width": li["width"], "signal": li["signal"], "phy_rx": li["phy_rx"],
+        "loss": lat["loss"], "avg": lat.get("avg"), "jitter": lat.get("jitter"), "p99": lat.get("p99"),
+        "spikes_min": lat.get("spikes", 0) * 2,
+        "down": down, "up": up,
+        "p99_load": max(x["p99"] for x in (dl, ul) if x and "p99" in x) if (dl or ul) else None,
+        "retry": d.get("MPDU: Tx total_mpdu_retries", 0) / tried * 100 if tried else None,
+        "fail": max(0, tried - d.get("Tx mpdu success count", 0)) / tried * 100 if tried else None,
+        "up_retry": d.get("Rx retry count", 0) / rx * 100 if rx else None,
+    }
+    say(f"  Router-Wiederholungen {res['retry'] or 0:.1f}% · endgültig verloren {res['fail'] or 0:.2f}% · "
+        f"vom PC wiederholt {res['up_retry'] or 0:.1f}%\n")
+    return res
+
+
+# ---------------------------------------------------------------- Auswertung
+METRICS = [  # key, name, format, lower_is_better, wichtig_fuer_cs2
+    ("loss", "Ping-Verlust", "{:.2f} %", True, True),
+    ("avg", "Ping Ø", "{:.1f} ms", True, True),
+    ("jitter", "Jitter", "{:.1f} ms", True, True),
+    ("p99", "Ping p99 (ohne Last)", "{:.0f} ms", True, True),
+    ("spikes_min", "Lag-Spitzen pro Minute", "{:.1f}", True, True),
+    ("p99_load", "Ping p99 unter Last", "{:.0f} ms", True, True),
+    ("retry", "Router-Wiederholungen", "{:.1f} %", True, True),
+    ("fail", "Endgültig verloren", "{:.2f} %", True, True),
+    ("up_retry", "PC-Wiederholungen", "{:.1f} %", True, False),
+    ("down", "Download (echt)", "{:.0f} Mbit/s", False, False),
+    ("up", "Upload (echt)", "{:.0f} Mbit/s", False, False),
+    ("phy_rx", "PHY-Rate ↓", "{:.0f} Mbit/s", False, False),
+    ("signal", "Signal", "{:.0f} dBm", False, False),
+]
+
+
+def avg_of(runs, key):
+    v = [r[key] for r in runs if r.get(key) is not None]
+    return statistics.mean(v) if v else None
+
+
+def report(results):
+    a = [r for r in results if r["mode"] == "Wi-Fi 6E"]
+    b = [r for r in results if r["mode"] == "Wi-Fi 7"]
+    print(f"\n  {BLD}{CYN}ERGEBNIS{RST}  {DIM}(Mittel aus {len(a)} + {len(b)} Durchgängen){RST}\n")
+    print(f"  {'':26} {'Wi-Fi 6E':>14} {'Wi-Fi 7':>14}   besser")
+    score = {"cs2": [0, 0], "speed": [0, 0]}
+    for key, name, fmt, lower, cs2 in METRICS:
+        x, y = avg_of(a, key), avg_of(b, key)
+        if x is None or y is None:
+            continue
+        win = ""
+        if abs(x - y) > max(abs(x), abs(y)) * 0.1 + (0.05 if "loss" in key or "fail" in key else 0.5):
+            better_a = (x < y) if lower else (x > y)
+            win = f"{GRN}Wi-Fi 6E{RST}" if better_a else f"{CYN}Wi-Fi 7{RST}"
+            if key != "signal" and key != "phy_rx":
+                grp = "cs2" if cs2 else "speed"
+                score[grp][0 if better_a else 1] += 1
+        else:
+            win = f"{DIM}gleich{RST}"
+        print(f"  {name:26} {fmt.format(x):>14} {fmt.format(y):>14}   {win}")
+    print()
+    c, s = score["cs2"], score["speed"]
+    cs2 = "Wi-Fi 6E" if c[0] > c[1] else "Wi-Fi 7" if c[1] > c[0] else "unentschieden"
+    spd = "Wi-Fi 6E" if s[0] > s[1] else "Wi-Fi 7" if s[1] > s[0] else "unentschieden"
+    say(f"{BLD}Für CS2 / Stabilität:{RST} {cs2}  {DIM}({c[0]}:{c[1]} Punkte bei Ping, Jitter, Verlust, Wiederholungen){RST}")
+    say(f"{BLD}Für Geschwindigkeit:{RST}  {spd}  {DIM}({s[0]}:{s[1]} Punkte bei Download/Upload){RST}")
+    return cs2
+
+
+def main():
+    global IFACE, MAC
+    ap = argparse.ArgumentParser(description="Wi-Fi 6E gegen Wi-Fi 7 vergleichen")
+    ap.add_argument("-r", "--runden", type=int, default=2, help="Durchgänge pro Modus (Standard 2)")
+    a = ap.parse_args()
+    if not PVE:
+        sys.exit("Bitte SERVER=user@ip in ~/.config/wlan-tools/config eintragen (Rechner per Kabel, mit python3).")
+    IFACE = re.search(r"Interface (\S+)", run(["iw", "dev"]).stdout).group(1)
+    MAC = open(f"/sys/class/net/{IFACE}/address").read().strip().lower()
+
+    print(f"\n  {BLD}{CYN}WLAN-VERGLEICH: Wi-Fi 6E gegen Wi-Fi 7{RST}\n")
+    say(f"Dauer ca. {a.runden * 2 * 1.5 + 1:.0f} Minuten. Bitte in der Zeit nichts herunterladen / streamen")
+    say("und den PC nicht bewegen. Zum Umschalten braucht es einmal dein sudo-Passwort.\n")
+    if subprocess.run(["sudo", "-v"]).returncode != 0:
+        sys.exit("sudo abgebrochen.")
+
+    stop = threading.Event()
+
+    def keep_sudo():
+        while not stop.wait(60):
+            subprocess.run(["sudo", "-n", "-v"], capture_output=True)
+    threading.Thread(target=keep_sudo, daemon=True).start()
+
+    start_eht = current_eht()
+    order = [start_eht, not start_eht] * a.runden
+    results = []
+    try:
+        for i, eht in enumerate(order, 1):
+            if not set_mode(eht):
+                say(f"{RED}Umschalten fehlgeschlagen – breche ab.{RST}")
+                break
+            warmup()
+            results.append(one_run(eht, i))
+    except KeyboardInterrupt:
+        print()
+        say(f"{YEL}Abgebrochen.{RST}")
+
+    if results:
+        os.makedirs(OUTDIR, exist_ok=True)
+        path = os.path.join(OUTDIR, time.strftime("%Y-%m-%d_%H%M.json"))
+        json.dump(results, open(path, "w"), indent=1)
+        rec = report(results) if {r["mode"] for r in results} == {"Wi-Fi 6E", "Wi-Fi 7"} else None
+        say(f"{DIM}Rohdaten: {path.replace(os.path.expanduser('~'), '~')}{RST}\n")
+    else:
+        rec = None
+
+    print(f"  {BLD}Welcher Modus soll bleiben?{RST}")
+    print(f"    [6] Wi-Fi 6E{'  (empfohlen für CS2)' if rec == 'Wi-Fi 6E' else ''}")
+    print(f"    [7] Wi-Fi 7{'  (empfohlen für CS2)' if rec == 'Wi-Fi 7' else ''}")
+    try:
+        ch = input("  Auswahl [6/7]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        ch = "6"
+    eht = ch == "7"
+    set_mode(eht)
+    if eht and os.path.exists(CONF):
+        try:
+            yn = input(f"  Sperrdatei {CONF} löschen, damit Wi-Fi 7 auch nach Neustart bleibt? [j/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            yn = ""
+        if yn == "j":
+            subprocess.run(["sudo", "rm", CONF])
+            say(f"{GRN}Gelöscht – Wi-Fi 7 bleibt dauerhaft.{RST} {DIM}(Ein Omarchy-Update kann sie neu anlegen.){RST}")
+        else:
+            say("Wi-Fi 7 gilt bis zum nächsten Neustart.")
+    elif not eht and not os.path.exists(CONF):
+        subprocess.run(["sudo", "sh", "-c", f"printf '# Wi-Fi 7 aus (wlan-vergleich)\\noptions iwlwifi disable_11be=Y\\n' > {CONF}"])
+        say("Sperrdatei wieder angelegt – Wi-Fi 6E bleibt dauerhaft.")
+    else:
+        say(f"{GRN}{mode_label(eht)} aktiv und bleibt so.{RST}")
+    stop.set()
+
+
+if __name__ == "__main__":
+    main()

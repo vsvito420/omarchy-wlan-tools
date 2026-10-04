@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Name=WLAN Gerätetest
+Comment=WLAN-Qualität eines Geräts testen (Wiederholungen, Verlust, Ping)
+Exec=xdg-terminal-exec --app-id=TUI.float -e bash -c '@BIN@/wlan-test; echo; read -n1 -s -p "  Taste drücken zum Schließen"'
+Terminal=false
+Type=Application
+Icon=network-wireless
+StartupNotify=true

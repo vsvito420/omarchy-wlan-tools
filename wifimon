@@ -1,0 +1,10 @@
+#!/bin/sh
+# Startet den WLAN-Signalmonitor (router/wifimon.sh) auf dem Router fuer diesen PC.
+# wifimon [intervall]   – z.B. "wifimon 2"
+# Einstellungen: ~/.config/wlan-tools/config (ROUTER_HOST, ROUTER_USER, ROUTER_PORT, ROUTER_SCRIPT)
+[ -f "$HOME/.config/wlan-tools/config" ] && . "$HOME/.config/wlan-tools/config"
+ROUTER_HOST=${ROUTER_HOST:-$(ip -4 route show default | awk '{print $3; exit}')}
+IF=$(iw dev 2>/dev/null | awk '$1=="Interface"{print $2; exit}')
+MAC=$(cat /sys/class/net/$IF/address)
+SSH_AUTH_SOCK=${SSH_AUTH_SOCK:-$XDG_RUNTIME_DIR/gcr/ssh} exec ssh -t -q -p "${ROUTER_PORT:-22}" "${ROUTER_USER:-admin}@$ROUTER_HOST" \
+  "sh ${ROUTER_SCRIPT:-/jffs/wifimon.sh} $MAC ${1:-1}"

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Name=WLAN Vergleich 6E/7
+Comment=Fairer A/B-Test Wi-Fi 6E gegen Wi-Fi 7 (Ping, Jitter, Speed)
+Exec=xdg-terminal-exec --app-id=TUI.tile -e @BIN@/wlan-vergleich
+Terminal=false
+Type=Application
+Icon=network-wireless
+StartupNotify=true

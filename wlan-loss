@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+"""wlan-loss – Paketverlust & Lag-Spitzen live analysieren (fuer CS2).
+
+Pingt gleichzeitig Router (WLAN), Provider, Valve-CS2-Relay und Internet,
+zeichnet pro Sekunde eine Zeitleiste und legt WLAN-Scans, Signal und
+Router-Wiederholungen daneben. Alles wird als CSV protokolliert.
+"""
+import os, re, select, shutil, statistics, subprocess, sys, termios, threading, time, tty
+from collections import defaultdict, deque
+
+# Einstellungen aus ~/.config/wlan-tools/config (siehe config.example); ohne Datei: Standard-Gateway
+def _cfg():
+    c = {}
+    try:
+        for line in open(os.path.expanduser("~/.config/wlan-tools/config")):
+            k, _, v = line.strip().partition("=")
+            if k and not k.startswith("#"):
+                c[k.strip()] = v.strip().strip("\"'")
+    except OSError:
+        pass
+    if not c.get("ROUTER_HOST"):
+        r = subprocess.run(["ip", "-4", "route", "show", "default"], capture_output=True, text=True).stdout.split()
+        c["ROUTER_HOST"] = r[r.index("via") + 1] if "via" in r else "192.168.1.1"
+    return c
+
+
+CFG = _cfg()
+ROUTER_IP = CFG["ROUTER_HOST"]
+ROUTER_LOGIN = f"{CFG.get('ROUTER_USER', 'admin')}@{ROUTER_IP}"
+ROUTER_PORT = CFG.get("ROUTER_PORT", "22")
+
+IFACE = None
+VALVE = ("155.133.226.68", "Valve CS2 Frankfurt")
+LOGDIR = os.path.expanduser("~/.local/state/wlan-loss")
+SSH = ["ssh", "-q", "-p", ROUTER_PORT, "-o", "BatchMode=yes", "-o", "ControlMaster=auto",
+       "-o", f"ControlPath={os.environ.get('XDG_RUNTIME_DIR', '/tmp')}/wlan-loss-ssh",
+       "-o", "ControlPersist=30", ROUTER_LOGIN]
+
+ESC = "\033["
+RST, BLD, DIM = ESC + "0m", ESC + "1m", ESC + "2m"
+RED, GRN, YEL, BLU, CYN, MAG = (ESC + c for c in ("31m", "32m", "33m", "34m", "36m", "35m"))
+
+START = time.time()
+lock = threading.Lock()
+events = deque(maxlen=200)          # (ts, text, color)
+scans = set()                       # Sekunden mit WLAN-Scan
+wifi = defaultdict(dict)            # sekunde -> werte
+router = {}                         # aktuelle Router-Werte
+router_hist = {}                    # sekunde -> retry%
+
+
+def event(text, color=""):
+    with lock:
+        events.append((time.time(), text, color))
+
+
+class Target:
+    def __init__(self, name, ip, interval, real=True):
+        self.name, self.ip, self.interval, self.real = name, ip, interval, real
+        self.pending = {}
+        self.sec = defaultdict(lambda: {"ok": 0, "lost": 0, "spike": 0, "max": 0.0})
+        self.rtts = deque(maxlen=400)
+        self.total_ok = self.total_lost = self.total_spike = 0
+        self.in_loss = False
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def base(self):
+        return statistics.median(self.rtts) if len(self.rtts) > 20 else None
+
+    def run(self):
+        p = subprocess.Popen(["ping", "-D", "-O", "-n", "-i", str(self.interval), "-W", "1", self.ip],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        for line in p.stdout:
+            m = re.match(r"\[(\d+\.\d+)\].*icmp_seq=(\d+)(?:.*time=([\d.]+))?", line)
+            if not m:
+                continue
+            ts, seq = float(m.group(1)), int(m.group(2))
+            with lock:
+                if "no answer yet" in line:
+                    self.pending.setdefault(seq, ts)
+                elif m.group(3):
+                    rtt = float(m.group(3))
+                    sent = self.pending.pop(seq, ts - rtt / 1000)
+                    b = self.base()
+                    s = self.sec[int(sent)]
+                    s["ok"] += 1
+                    s["max"] = max(s["max"], rtt)
+                    self.total_ok += 1
+                    if b is not None and rtt > b + 30:
+                        s["spike"] += 1
+                        self.total_spike += 1
+                    self.rtts.append(rtt)
+
+    def expire(self, now):
+        with lock:
+            for seq, t in list(self.pending.items()):
+                if now - t > 1.5:
+                    del self.pending[seq]
+                    self.sec[int(t)]["lost"] += 1
+                    self.total_lost += 1
+
+    def window(self, now, secs):
+        ok = lost = spike = 0
+        rt = []
+        for t in range(int(now) - secs, int(now) - 1):
+            s = self.sec.get(t)
+            if s:
+                ok += s["ok"]; lost += s["lost"]; spike += s["spike"]
+        return ok, lost, spike
+
+
+def iw_events():
+    p = subprocess.Popen(["iw", "event", "-t"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+    for line in p.stdout:
+        m = re.match(r"(\d+\.\d+): (\S+).*?: (.*)", line.strip())
+        if not m or m.group(2) != IFACE:
+            continue
+        ts, what = float(m.group(1)), m.group(3)
+        if what.startswith("scan started"):
+            with lock:
+                scans.add(int(ts))
+            event("WLAN-Scan gestartet (Karte verlässt kurz den Kanal)", BLU)
+        elif "disconnected" in what or "deauth" in what:
+            event("WLAN getrennt: " + what, RED)
+        elif "connected to" in what:
+            event("WLAN verbunden: " + what, YEL)
+        elif "ch_switch" in what:
+            event("Kanalwechsel: " + what, YEL)
+
+
+def poll_wifi():
+    prev = {}
+    while True:
+        out = subprocess.run(["iw", "dev", IFACE, "station", "dump"], capture_output=True, text=True).stdout
+        now = int(time.time())
+        v = {}
+        for key, rx in (("signal", r"^\s*signal:\s*(-?\d+)"), ("beacon_loss", r"beacon loss:\s*(\d+)"),
+                        ("tx_failed", r"tx failed:\s*(\d+)"), ("rx_drop", r"rx drop misc:\s*(\d+)")):
+            m = re.search(rx, out, re.M)
+            if m:
+                v[key] = int(m.group(1))
+        m = re.search(r"rx bitrate:\s*([\d.]+) MBit/s.*?(EHT|HE|VHT)-MCS (\d+).*?NSS (\d)", out)
+        if m:
+            v["rate"], v["mcs"], v["nss"] = float(m.group(1)), int(m.group(3)), int(m.group(4))
+        for k in ("beacon_loss", "tx_failed"):
+            if k in v and k in prev and v[k] > prev[k]:
+                event(f"{'Beacon verloren' if k == 'beacon_loss' else 'Senden fehlgeschlagen'}: +{v[k] - prev[k]}", RED)
+        with lock:
+            wifi[now] = v
+        prev = v
+        time.sleep(1)
+
+
+def poll_router(mac):
+    prev = None
+    cmd = SSH + [f"apstats -s -m {mac} | grep -E 'Tx mpdu tried count|Tx mpdu success count|MPDU: Tx total_mpdu_retries|Rx retry count|Rx mpdu count'"]
+    env = dict(os.environ)
+    env.setdefault("SSH_AUTH_SOCK", f"{os.environ.get('XDG_RUNTIME_DIR')}/gcr/ssh")
+    while True:
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=5, env=env).stdout
+            v = {}
+            for line in out.splitlines():
+                k, _, val = line.partition("=")
+                v[k.strip()] = int(val.strip() or 0)
+            if prev and v:
+                tried = v["Tx mpdu tried count"] - prev["Tx mpdu tried count"]
+                retr = v["MPDU: Tx total_mpdu_retries"] - prev["MPDU: Tx total_mpdu_retries"]
+                fail = tried - (v["Tx mpdu success count"] - prev["Tx mpdu success count"])
+                rxm = v["Rx mpdu count"] - prev["Rx mpdu count"]
+                rxr = v["Rx retry count"] - prev["Rx retry count"]
+                r = {"tx_retry": retr / tried * 100 if tried > 0 else 0,
+                     "tx_fail": max(0, fail) / tried * 100 if tried > 0 else 0,
+                     "rx_retry": rxr / rxm * 100 if rxm > 0 else 0, "ok": True}
+                with lock:
+                    router.update(r)
+                    router_hist[int(time.time())] = r["tx_retry"]
+                if r["tx_retry"] > 30:
+                    event(f"Router muss {r['tx_retry']:.0f}% der Pakete an dich wiederholen", YEL)
+            prev = v or prev
+        except Exception:
+            router["ok"] = False
+        time.sleep(2)
+
+
+def provider_hop():
+    try:
+        out = subprocess.run(["tracepath", "-n", "-m", "3", "1.1.1.1"], capture_output=True, text=True, timeout=15).stdout
+        for line in out.splitlines():
+            m = re.match(r"\s*2:\s+(\d+\.\d+\.\d+\.\d+)", line)
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+    return None
+
+
+def timeline(t, now, width):
+    out = []
+    for s in range(int(now) - width - 1, int(now) - 1):
+        d = t.sec.get(s)
+        if not d or (d["ok"] + d["lost"]) == 0:
+            out.append(" ")
+        elif d["lost"]:
+            out.append(RED + "█" + RST)
+        elif d["spike"]:
+            out.append(YEL + "▅" + RST)
+        else:
+            out.append(GRN + "▁" + RST)
+    return "".join(out)
+
+
+def pct(a, b):
+    return a / b * 100 if b else 0.0
+
+
+def lcol(p):
+    return GRN if p == 0 else YEL if p < 1 else RED
+
+
+def main():
+    global IFACE
+    out = subprocess.run(["iw", "dev"], capture_output=True, text=True).stdout
+    IFACE = re.search(r"Interface (\S+)", out).group(1)
+    mac = open(f"/sys/class/net/{IFACE}/address").read().strip()
+
+    os.makedirs(LOGDIR, exist_ok=True)
+    logpath = os.path.join(LOGDIR, time.strftime("%Y-%m-%d_%H%M%S.csv"))
+    logf = open(logpath, "w")
+
+    targets = [Target("WLAN → Router", ROUTER_IP, 0.025),
+               Target(VALVE[1], VALVE[0], 0.025)]
+    targets.append(Target("Internet (1.1.1.1)", "1.1.1.1", 0.1))
+    threading.Thread(target=iw_events, daemon=True).start()
+    threading.Thread(target=poll_wifi, daemon=True).start()
+    threading.Thread(target=poll_router, args=(mac,), daemon=True).start()
+
+    def add_provider():
+        ip = provider_hop()
+        if ip:
+            targets.insert(1, Target("Provider-Router", ip, 0.2, real=False))
+    threading.Thread(target=add_provider, daemon=True).start()
+
+    logf.write("zeit,ziel,ok,verloren,spitzen,max_ms,scan,signal,router_retry\n")
+    logged = int(time.time()) - 1
+    event("Messung gestartet. Jetzt CS2 spielen und das Fenster offen lassen.", CYN)
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    tty.setcbreak(fd)
+    sys.stdout.write(ESC + "?25l" + ESC + "2J")
+    try:
+        while True:
+            now = time.time()
+            for t in list(targets):
+                t.expire(now)
+            # CSV fuer abgeschlossene Sekunden
+            while logged < int(now) - 2:
+                logged += 1
+                with lock:
+                    w = wifi.get(logged, {})
+                    for t in targets:
+                        d = t.sec.get(logged, {"ok": 0, "lost": 0, "spike": 0, "max": 0})
+                        rr = f"{router_hist[logged]:.1f}" if logged in router_hist else ""
+                        logf.write(f"{time.strftime('%H:%M:%S', time.localtime(logged))},{t.name},{d['ok']},{d['lost']},"
+                                   f"{d['spike']},{d['max']:.1f},{int(logged in scans)},{w.get('signal', '')},{rr}\n")
+                        if d["lost"] and not t.in_loss and t.real:
+                            event(f"{t.name}: {d['lost']} Pakete verloren", RED)
+                        t.in_loss = bool(d["lost"])
+                logf.flush()
+
+            while select.select([sys.stdin], [], [], 0)[0]:
+                c = sys.stdin.read(1)
+                if c in "qQ":
+                    return logpath
+
+            cols = shutil.get_terminal_size((100, 40)).columns
+            tw = max(20, min(120, cols - 52))
+            o = [ESC + "H" + ESC + "J"]
+            dur = int(now - START)
+            o.append(f"{BLD}{CYN}  PAKETVERLUST-MONITOR{RST}  {DIM}läuft {dur // 60}:{dur % 60:02d} min · Log: {logpath.replace(os.path.expanduser('~'), '~')}{RST}\n\n")
+            o.append(f"  {'':22} {'Verlust':>8} {'Lags':>6} {'Ping Ø':>7} {'Jitter':>6}   {DIM}letzte {tw} s  ({GRN}▁{RST}{DIM} ok  {YEL}▅{RST}{DIM} Lag  {RED}█{RST}{DIM} Verlust){RST}\n")
+            with lock:
+                for t in targets:
+                    tot = t.total_ok + t.total_lost
+                    lp = pct(t.total_lost, tot)
+                    r = list(t.rtts)[-200:]
+                    avg = statistics.mean(r) if r else 0
+                    jit = statistics.mean(abs(a - b) for a, b in zip(r, r[1:])) if len(r) > 2 else 0
+                    name = t.name + ("" if t.real else "*")
+                    o.append(f"  {name:22} {lcol(lp)}{lp:7.2f}%{RST} {(YEL if t.total_spike else GRN)}{t.total_spike:6}{RST} "
+                             f"{avg:6.1f}ms {jit:5.1f}ms   {timeline(t, now, tw)}\n")
+                sc = "".join(BLU + "│" + RST if s in scans else " " for s in range(int(now) - tw - 1, int(now) - 1))
+                o.append(f"  {'WLAN-Scans':22} {'':31}   {sc}\n")
+                rh = "".join(
+                    (RED + "█" if router_hist[s] > 30 else YEL + "▄" if router_hist[s] > 10 else GRN + "▁") + RST
+                    if s in router_hist else " " for s in range(int(now) - tw - 1, int(now) - 1))
+                o.append(f"  {'Router-Wiederholungen':22} {'':31}   {rh}\n")
+                o.append(f"  {DIM}* Provider-Router beantworten Pings nur nebenbei – Verlust dort ist meist harmlos.{RST}\n\n")
+
+                w = wifi.get(int(now) - 1) or wifi.get(int(now) - 2) or {}
+                sig = w.get("signal")
+                rr = router if router.get("ok") else {}
+                o.append(f"  {BLD}WLAN jetzt{RST}  Signal {sig if sig is not None else '?'} dBm · "
+                         f"↓ {w.get('rate', 0):.0f} Mbit/s MCS {w.get('mcs', '?')} NSS {w.get('nss', '?')} · "
+                         f"Router-Wiederholungen {rr.get('tx_retry', 0):.0f}% · ↑ Wiederholungen {rr.get('rx_retry', 0):.0f}%\n\n")
+
+                # Diagnose
+                wl = targets[0]
+                inet = [t for t in targets[1:] if t.real]
+                wl_bad = wl.total_lost + wl.total_spike
+                inet_bad = sum(t.total_lost for t in inet)
+                lag_in_scan = sum(1 for s, d in wl.sec.items() if (d["lost"] or d["spike"]) and
+                                  any(x in scans for x in (s - 1, s, s + 1)))
+                o.append(f"  {BLD}Diagnose{RST}  ")
+                if dur < 30:
+                    o.append(f"{DIM}sammle Daten …{RST}\n")
+                elif wl_bad == 0 and inet_bad == 0:
+                    o.append(f"{GRN}bisher keine Probleme gemessen{RST}\n")
+                else:
+                    lines = []
+                    if wl_bad:
+                        lines.append(f"{YEL}WLAN: {wl.total_lost} verloren, {wl.total_spike} Lag-Spitzen zwischen PC und Router{RST}")
+                        if lag_in_scan:
+                            lines.append(f"{BLU}→ {lag_in_scan} davon zeitgleich mit einem WLAN-Scan – Hintergrund-Scans sind ein Verdächtiger{RST}")
+                    if inet_bad and not wl.total_lost:
+                        lines.append(f"{RED}Internet: Verlust nach dem Router, WLAN sauber → liegt am Provider/Internet{RST}")
+                    elif inet_bad:
+                        lines.append(f"Internet: {inet_bad} verloren (teils durch WLAN verursacht)")
+                    o.append(("\n            ").join(lines) + "\n")
+                o.append("\n")
+
+                o.append(f"  {BLD}Ereignisse{RST}\n")
+                for ts, text, col in list(events)[-8:]:
+                    o.append(f"  {DIM}{time.strftime('%H:%M:%S', time.localtime(ts))}{RST}  {col}{text}{RST}\n")
+            o.append(f"\n  {DIM}[q] beenden{RST}\n")
+            sys.stdout.write("".join(o))
+            sys.stdout.flush()
+            time.sleep(0.5)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write(ESC + "?25h\n")
+        logf.close()
+
+
+if __name__ == "__main__":
+    try:
+        p = main()
+        if p:
+            print(f"Log gespeichert: {p}")
+    except KeyboardInterrupt:
+        pass

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Name=WLAN Router-Monitor
+Comment=Signalstärke dieses PCs live vom Router
+Exec=xdg-terminal-exec --app-id=TUI.tile -e @BIN@/wifimon
+Terminal=false
+Type=Application
+Icon=network-wireless
+StartupNotify=true

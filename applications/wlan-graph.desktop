@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Name=WLAN Graph
+Comment=Alle WLAN-Geräte als Live-Radar – Abstand zeigt den Empfang
+Exec=@BIN@/wlan-graph
+Terminal=false
+Type=Application
+Icon=network-wireless
+StartupNotify=true

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Name=WLAN Antenne
+Comment=WLAN-Antennen am PC ausrichten (Punktzahl, Ströme, MCS-Verlauf)
+Exec=xdg-terminal-exec --app-id=TUI.tile -e @BIN@/antenne
+Terminal=false
+Type=Application
+Icon=network-wireless
+StartupNotify=true

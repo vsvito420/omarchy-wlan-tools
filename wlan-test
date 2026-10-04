@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""wlan-test – testet die WLAN-Qualitaet eines Geraets ueber den Router (ASUS/Qualcomm).
+
+  wlan-test                 Geraeteliste zur Auswahl
+  wlan-test 192.168.1.27   per IP
+  wlan-test iphone          per Name (Teil reicht)
+  wlan-test b6:92:...       per MAC
+  wlan-test .27 -t 40       40 Sekunden statt 20
+
+Der PC schickt Pings ans Geraet, damit der Router Daten senden muss.
+Vorher/nachher werden die Router-Zaehler gelesen: daraus ergeben sich
+Wiederholungen und Verluste in beide Richtungen.
+"""
+import argparse, csv, os, re, subprocess, sys, time
+
+# Einstellungen aus ~/.config/wlan-tools/config (siehe config.example); ohne Datei: Standard-Gateway
+def _cfg():
+    c = {}
+    try:
+        for line in open(os.path.expanduser("~/.config/wlan-tools/config")):
+            k, _, v = line.strip().partition("=")
+            if k and not k.startswith("#"):
+                c[k.strip()] = v.strip().strip("\"'")
+    except OSError:
+        pass
+    if not c.get("ROUTER_HOST"):
+        r = subprocess.run(["ip", "-4", "route", "show", "default"], capture_output=True, text=True).stdout.split()
+        c["ROUTER_HOST"] = r[r.index("via") + 1] if "via" in r else "192.168.1.1"
+    return c
+
+
+CFG = _cfg()
+ROUTER_IP = CFG["ROUTER_HOST"]
+ROUTER_LOGIN = f"{CFG.get('ROUTER_USER', 'admin')}@{ROUTER_IP}"
+ROUTER_PORT = CFG.get("ROUTER_PORT", "22")
+
+SSH = ["ssh", "-q", "-p", ROUTER_PORT, "-o", "BatchMode=yes", "-o", "ControlMaster=auto",
+       "-o", f"ControlPath={os.environ.get('XDG_RUNTIME_DIR', '/tmp')}/wlan-test-ssh",
+       "-o", "ControlPersist=60", ROUTER_LOGIN]
+RESULTS = os.path.expanduser("~/.local/state/wlan-test/ergebnisse.csv")
+
+ESC = "\033["
+RST, BLD, DIM = ESC + "0m", ESC + "1m", ESC + "2m"
+RED, GRN, YEL, CYN = ESC + "31m", ESC + "32m", ESC + "33m", ESC + "36m"
+
+LIST = r'''
+for d in /sys/class/net/ath*; do
+  i=${d##*/}
+  s=$(iwconfig $i 2>/dev/null | sed -n 's/.*ESSID:"\([^"]*\)".*/\1/p')
+  f=$(iwconfig $i 2>/dev/null | sed -n 's/.*Frequency:\([0-9.]*\) GHz.*/\1/p')
+  wlanconfig $i list sta 2>/dev/null | awk -v i=$i -v s="$s" -v f=$f '
+    $1 ~ /^[0-9a-f][0-9a-f]:/ { m = ""; for (k = 12; k <= NF; k++) if ($k ~ /^IEEE80211_MODE_/) m = substr($k, 16)
+      printf "STA\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", i, s, f, $1, $6, $4, $5, m, $9 }'
+done
+awk '{ printf "LEASE\t%s\t%s\t%s\n", $2, $3, $4 }' /var/lib/misc/dnsmasq.leases
+'''
+
+COUNTERS = ["Tx mpdu tried count", "Tx mpdu success count", "MPDU: Tx total_mpdu_retries",
+            "Rx mpdu count", "Rx retry count", "Tx Data Packets", "Rx Data Packets"]
+
+
+def ssh(cmd):
+    env = dict(os.environ)
+    env.setdefault("SSH_AUTH_SOCK", f"{os.environ.get('XDG_RUNTIME_DIR')}/gcr/ssh")
+    r = subprocess.run(SSH + [cmd], capture_output=True, text=True, timeout=30, env=env)
+    if r.returncode != 0 and not r.stdout:
+        sys.exit("Router nicht erreichbar (SSH).")
+    return r.stdout
+
+
+def devices():
+    out = ssh(LIST)
+    leases, devs = {}, []
+    for line in out.splitlines():
+        p = line.split("\t")
+        if p[0] == "LEASE" and len(p) >= 4:
+            leases[p[1].lower()] = (p[2], "" if p[3] == "*" else p[3])
+    for line in out.splitlines():
+        p = line.split("\t")
+        if p[0] == "STA" and len(p) >= 10:
+            _, vap, ssid, freq, mac, rssi, tx, rx, mode, idle = p[:10]
+            ip, name = leases.get(mac.lower(), ("", ""))
+            f = float(freq or 0)
+            devs.append(dict(vap=vap, ssid=ssid, band="2,4" if f < 3 else "5" if f < 5.9 else "6",
+                             mac=mac.lower(), rssi=int(rssi), tx=tx, rx=rx, mode=mode, ip=ip, name=name,
+                             idle=int(idle) if idle.isdigit() else 999))
+    # Geraete, die gerade das Band gewechselt haben, stehen kurz doppelt drin -> aktiven Eintrag nehmen
+    best = {}
+    for d in devs:
+        if d["mac"] not in best or d["idle"] < best[d["mac"]]["idle"]:
+            best[d["mac"]] = d
+    return list(best.values())
+
+
+def label(d):
+    return d["name"] or (d["ip"] and "." + d["ip"].split(".")[-1]) or d["mac"]
+
+
+def pick(devs, query):
+    if query:
+        q = query.lower()
+        hits = [d for d in devs if q in (d["ip"], d["mac"]) or (q.startswith(".") and d["ip"].endswith(q))
+                or (d["name"] and q in d["name"].lower())]
+        if len(hits) == 1:
+            return hits[0]
+        if not hits:
+            sys.exit(f"Kein verbundenes WLAN-Gerät passt zu „{query}“.")
+        devs = hits
+    print(f"\n  {BLD}Verbundene WLAN-Geräte{RST}\n")
+    for n, d in enumerate(devs, 1):
+        c = GRN if d["rssi"] >= -60 else YEL if d["rssi"] >= -70 else RED
+        print(f"  {n:2}  {label(d):24} {d['ip']:15} {d['ssid']:6} {d['band']:>3} GHz  {c}{d['rssi']:4} dBm{RST}  {DIM}{d['mode']}{RST}")
+    try:
+        n = int(input("\n  Nummer: "))
+        return devs[n - 1]
+    except (ValueError, IndexError, EOFError, KeyboardInterrupt):
+        sys.exit()
+
+
+def counters(d):
+    # apstats -s -m nimmt bei doppelten Eintraegen (Bandwechsel) evtl. den falschen -> ueber die VAP gehen
+    out = ssh(f"apstats -v -i {d['vap']} -R | awk 'tolower($0) ~ /node level stats: {d['mac']}/ {{on=1; next}} "
+              f"/Node Level Stats/ {{on=0}} on'; wlanconfig {d['vap']} list sta | grep -i '^{d['mac']}'")
+    c = {}
+    for line in out.splitlines():
+        k, sep, v = line.partition("=")
+        if sep and k.strip() in COUNTERS:
+            c[k.strip()] = int(v.strip() or 0)
+        elif line.lower().startswith(d["mac"]):
+            f = line.split()
+            c["rssi"], c["tx"], c["rx"] = int(f[5]), f[3], f[4]
+    return c
+
+
+def local_macs():
+    m = set()
+    for n in os.listdir("/sys/class/net"):
+        try:
+            m.add(open(f"/sys/class/net/{n}/address").read().strip())
+        except OSError:
+            pass
+    return m
+
+
+def col(v, good, ok):
+    return GRN if v <= good else YEL if v <= ok else RED
+
+
+def main():
+    ap = argparse.ArgumentParser(description="WLAN-Qualität eines Geräts testen")
+    ap.add_argument("geraet", nargs="?", help="IP, .Endziffer, Name oder MAC")
+    ap.add_argument("-t", "--sekunden", type=int, default=20)
+    a = ap.parse_args()
+
+    d = pick(devices(), a.geraet)
+    me = d["mac"] in local_macs()
+    target = ROUTER_IP if me else d["ip"]
+    if not target:
+        sys.exit("Gerät hat keine IP (kein DHCP-Eintrag) – Test nicht möglich.")
+
+    print(f"\n  {BLD}{CYN}WLAN-Test{RST}  {BLD}{label(d)}{RST}  {d['ip']}  {DIM}{d['mac']}{RST}")
+    print(f"  Netz {d['ssid']} · {d['band']} GHz · {d['mode']} · Signal {d['rssi']} dBm")
+    if not me:
+        print(f"  {YEL}Handy/Tablet: Bildschirm entsperrt lassen, sonst schläft das WLAN.{RST}")
+    print(f"  {DIM}Teste {a.sekunden} s …{RST}", flush=True)
+
+    c0 = counters(d)
+    n = a.sekunden * 50
+    p = subprocess.run(["ping", "-i", "0.02", "-s", "1400", "-W", "1", "-c", str(n), "-q", target],
+                       capture_output=True, text=True)
+    c1 = counters(d)
+    if not c0 or not c1:
+        sys.exit("Gerät während des Tests getrennt.")
+
+    dd = {k: c1.get(k, 0) - c0.get(k, 0) for k in COUNTERS}
+    tried = dd["Tx mpdu tried count"]
+    dn_retry = dd["MPDU: Tx total_mpdu_retries"] / tried * 100 if tried else 0
+    dn_fail = max(0, tried - dd["Tx mpdu success count"]) / tried * 100 if tried else 0
+    up_retry = dd["Rx retry count"] / dd["Rx mpdu count"] * 100 if dd["Rx mpdu count"] else 0
+    m = re.search(r"(\d+) received, ([\d.]+)% packet loss", p.stdout)
+    loss = float(m.group(2)) if m else 100.0
+    m = re.search(r"= ([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+)", p.stdout)
+    rmin, ravg, rmax, rdev = (float(x) for x in m.groups()) if m else (0, 0, 0, 0)
+
+    print(f"\n  {BLD}Ergebnis{RST}")
+    print(f"  {'Router → Gerät':18} Wiederholungen {col(dn_retry, 5, 15)}{dn_retry:5.1f}%{RST}   "
+          f"endgültig verloren {col(dn_fail, 0.1, 1)}{dn_fail:4.1f}%{RST}   {DIM}({tried} Pakete){RST}")
+    print(f"  {'Gerät → Router':18} Wiederholungen {col(up_retry, 5, 15)}{up_retry:5.1f}%{RST}   "
+          f"{DIM}({dd['Rx mpdu count']} Pakete){RST}")
+    print(f"  {'Ping':18} Verlust {col(loss, 0, 1)}{loss:.1f}%{RST}   Ø {ravg:.1f} ms   max {rmax:.0f} ms   Jitter {rdev:.1f} ms")
+    print(f"  {'Signal':18} {c0.get('rssi', d['rssi'])} → {c1.get('rssi', '?')} dBm   Rate ↓ {c1.get('tx', '?')} ↑ {c1.get('rx', '?')}")
+
+    print(f"\n  {BLD}Bewertung{RST}")
+    if tried < 300:
+        print(f"  {YEL}Zu wenig Verkehr gemessen – Gerät antwortet evtl. nicht auf Ping oder schläft.{RST}")
+    v = []
+    v.append(f"{GRN}Router → Gerät sauber{RST}" if dn_retry <= 5 else
+             f"{YEL}Router → Gerät: einige Wiederholungen (leichter Jitter){RST}" if dn_retry <= 15 else
+             f"{RED}Router → Gerät: viele Wiederholungen – Funkproblem in diese Richtung{RST}")
+    v.append(f"{GRN}Gerät → Router sauber{RST}" if up_retry <= 5 else
+             f"{YEL}Gerät → Router: einige Wiederholungen (Gerät sendet schwächer){RST}" if up_retry <= 15 else
+             f"{RED}Gerät → Router: viele Wiederholungen – Gerät kommt schlecht durch{RST}")
+    if dn_retry <= 5 and (ravg > 30 or loss > 0.5) and not me:
+        v.append(f"{DIM}Ping schlecht trotz sauberem Funk → Gerät spart Strom/antwortet nebenbei (bei Handys normal){RST}")
+    for x in v:
+        print("  " + x)
+
+    os.makedirs(os.path.dirname(RESULTS), exist_ok=True)
+    new = not os.path.exists(RESULTS)
+    with open(RESULTS, "a", newline="") as f:
+        w = csv.writer(f)
+        if new:
+            w.writerow(["zeit", "geraet", "ip", "mac", "netz", "band", "modus", "signal",
+                        "router_wdh_%", "verloren_%", "geraet_wdh_%", "ping_verlust_%", "ping_avg_ms", "ping_max_ms"])
+        w.writerow([time.strftime("%Y-%m-%d %H:%M"), label(d), d["ip"], d["mac"], d["ssid"], d["band"], d["mode"],
+                    c1.get("rssi", d["rssi"]), f"{dn_retry:.1f}", f"{dn_fail:.2f}", f"{up_retry:.1f}",
+                    f"{loss:.1f}", f"{ravg:.1f}", f"{rmax:.0f}"])
+    with open(RESULTS) as f:
+        hist = [r for r in csv.DictReader(f) if r["mac"] == d["mac"]]
+    if len(hist) > 1:
+        print(f"\n  {BLD}Bisherige Tests dieses Geräts{RST}")
+        print(f"  {DIM}{'Zeit':17} {'Modus':14} {'Signal':>6} {'R→G':>6} {'G→R':>6} {'Ping Ø':>7}{RST}")
+        for r in hist[-8:]:
+            print(f"  {r['zeit']:17} {r['modus']:14} {r['signal']:>6} {r['router_wdh_%']:>5}% {r['geraet_wdh_%']:>5}% {r['ping_avg_ms']:>5}ms")
+    print()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print()

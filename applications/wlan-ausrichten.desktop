@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Name=WLAN Antenne ausrichten
+Comment=Router-Antennen ausrichten – besser/schlechter je Position, Kerzen-Chart, Topscore
+Exec=@BIN@/wlan-graph --ausrichten
+Terminal=false
+Type=Application
+Icon=network-wireless
+StartupNotify=true

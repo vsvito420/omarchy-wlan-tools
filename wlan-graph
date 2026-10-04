@@ -1,0 +1,897 @@
+#!/usr/bin/env python3
+"""wlan-graph – Live-Graph aller WLAN-Geraete am ASUS-Router (Obsidian-Stil).
+
+--demo zeigt erfundene Netze/Geraete (zufaellige Namen).
+--ausrichten oeffnet die Seite zum Ausrichten der Router-Antennen (/ausrichten).
+
+Startet einen kleinen lokalen Server (127.0.0.1:8765) und oeffnet die Seite als
+Omarchy-Web-App. Der Server beendet sich selbst, wenn die Seite zu ist.
+"""
+import http.server, json, os, re, socket, subprocess, sys, threading, time
+
+# Einstellungen aus ~/.config/wlan-tools/config (siehe config.example); ohne Datei: Standard-Gateway
+def _cfg():
+    c = {}
+    try:
+        for line in open(os.path.expanduser("~/.config/wlan-tools/config")):
+            k, _, v = line.strip().partition("=")
+            if k and not k.startswith("#"):
+                c[k.strip()] = v.strip().strip("\"'")
+    except OSError:
+        pass
+    if not c.get("ROUTER_HOST"):
+        r = subprocess.run(["ip", "-4", "route", "show", "default"], capture_output=True, text=True).stdout.split()
+        c["ROUTER_HOST"] = r[r.index("via") + 1] if "via" in r else "192.168.1.1"
+    return c
+
+
+CFG = _cfg()
+ROUTER_IP = CFG["ROUTER_HOST"]
+ROUTER_LOGIN = f"{CFG.get('ROUTER_USER', 'admin')}@{ROUTER_IP}"
+ROUTER_PORT = CFG.get("ROUTER_PORT", "22")
+
+PORT = 8766 if "--demo" in sys.argv else 8765
+ROUTER = ["ssh", "-q", "-p", ROUTER_PORT, "-o", "BatchMode=yes",
+          "-o", "ControlMaster=auto", "-o", f"ControlPath={os.environ.get('XDG_RUNTIME_DIR', '/tmp')}/wlan-graph-ssh",
+          "-o", "ControlPersist=60", ROUTER_LOGIN]
+IDLE_EXIT = 45  # Sekunden ohne Abfrage -> Server beendet sich
+# --lan: fürs Handy im Heimnetz – eigener Port, auf allen Adressen, nur mit geheimem Link
+LAN = "--lan" in sys.argv
+LAN_PORT = 8775
+LAN_IDLE = 3600  # Handy-Browser pausieren im Hintergrund, darum großzügiger
+TOKEN_FILE = os.path.expanduser("~/.local/state/wlan-graph/token")
+
+REMOTE = r'''
+for d in /sys/class/net/ath*; do
+  i=${d##*/}
+  iwconfig $i 2>/dev/null | awk -v i=$i '
+    /ESSID/ { match($0, /ESSID:"[^"]*"/); s = substr($0, RSTART + 7, RLENGTH - 8) }
+    /Frequency/ { match($0, /Frequency:[0-9.]+/); f = substr($0, RSTART + 10, RLENGTH - 10) }
+    END { if (f != "") printf "VAP\t%s\t%s\t%s\n", i, f, s }'
+  wlanconfig $i list sta 2>/dev/null | awk -v i=$i '
+    $1 ~ /^[0-9a-f][0-9a-f]:/ {
+      mode = ""; at = ""
+      for (k = 12; k <= NF; k++) {
+        if ($k ~ /^IEEE80211_MODE_/) mode = substr($k, 16)
+        if ($k ~ /^[0-9]+:[0-9]+:[0-9]+$/) at = $k
+      }
+      printf "STA\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", i, $1, $6, $4, $5, mode, at, $7, $8
+      last = $1
+    }
+    /MLD Addr/ { printf "MLD\t%s\t%s\n", last, $NF }'
+done
+awk '{ printf "LEASE\t%s\t%s\t%s\n", $2, $3, $4 }' /var/lib/misc/dnsmasq.leases 2>/dev/null
+awk 'NR > 1 && $4 != "00:00:00:00:00:00" { printf "ARP\t%s\t%s\n", $4, $1 }' /proc/net/arp 2>/dev/null
+'''
+
+last_hit = time.time()
+cache = {"t": 0, "data": None}
+lock = threading.Lock()
+
+
+def local_macs():
+    macs = set()
+    for n in os.listdir("/sys/class/net"):
+        try:
+            macs.add(open(f"/sys/class/net/{n}/address").read().strip().lower())
+        except OSError:
+            pass
+    return macs
+
+
+def band(freq):
+    f = float(freq)
+    return "2.4" if f < 3 else "5" if f < 5.9 else "6"
+
+
+def fetch():
+    env = dict(os.environ)
+    env.setdefault("SSH_AUTH_SOCK", f"{os.environ.get('XDG_RUNTIME_DIR')}/gcr/ssh")
+    out = subprocess.run(ROUTER + [REMOTE], capture_output=True, text=True, timeout=20, env=env).stdout
+    vaps, stas, leases, mld, arp = {}, [], {}, {}, {}
+    for line in out.splitlines():
+        p = line.split("\t")
+        if p[0] == "VAP" and len(p) >= 4:
+            vaps[p[1]] = {"freq": p[2], "ssid": p[3]}
+        elif p[0] == "STA" and len(p) >= 10:
+            stas.append(p[1:])
+        elif p[0] == "MLD" and len(p) >= 3:
+            mld[p[1].lower()] = p[2].lower()   # Wi-Fi 7 MLO: zufällige Band-Adresse -> echte Geräte-MAC
+        elif p[0] == "ARP" and len(p) >= 3:
+            arp.setdefault(p[1].lower(), p[2])
+        elif p[0] == "LEASE" and len(p) >= 4:
+            leases[p[1].lower()] = (p[2], p[3])
+    mine = local_macs()
+    ssids = {}
+    for v in vaps.values():
+        s = v["ssid"]
+        if not s or re.fullmatch(r"[0-9A-F]{32}", s):   # interne/versteckte Router-Netze
+            continue
+        ssids.setdefault(s, set()).add(band(v["freq"]))
+    devices = []
+    for vap, mac, rssi, tx, rx, mode, at, rmin, rmax in stas:
+        v = vaps.get(vap, {})
+        mac = mld.get(mac.lower(), mac)
+        ip, name = leases.get(mac.lower(), ("", ""))
+        if not ip and mac.lower() in arp:   # z. B. ASUS-Repeater: WLAN-MAC ≠ MAC, mit der die IP geholt wurde
+            ip = arp[mac.lower()]
+            name = next((n for i, n in leases.values() if i == ip), "")
+        devices.append({
+            "mac": mac.lower(), "ssid": v.get("ssid", "?"), "band": band(v.get("freq", "0")),
+            "rssi": int(rssi), "rmin": int(rmin) if rmin.lstrip("-").isdigit() else None,
+            "rmax": int(rmax) if rmax.lstrip("-").isdigit() else None,
+            "tx": tx, "rx": rx, "mode": mode, "since": at, "ip": ip,
+            "name": "" if name in ("*", "") else name, "me": mac.lower() in mine,
+        })
+    return {"ssids": {k: sorted(v) for k, v in ssids.items()}, "devices": devices, "time": time.strftime("%H:%M:%S")}
+
+
+DEMO = "--demo" in sys.argv   # erfundene Netze und Geräte, z. B. für Screenshots
+_demo = []
+
+
+def demo_data():
+    import random
+    if not _demo:
+        words = ["Kaktus", "Nebel", "Pixel", "Falke", "Orbit", "Wolke", "Mango", "Funke", "Quarz", "Komet", "Lotus", "Biber"]
+        nets = [f"{w}-{random.randint(10, 99)}" for w in random.sample(words, 3)]
+        bands = [["2.4", "5"], ["6"], ["2.4", "5", "6"]]
+        kinds = ["PC", "Handy", "Laptop", "TV", "Tablet", "Konsole", "Drucker", "Lampe", "Steckdose", "Uhr", "Lautsprecher", "Kamera"]
+        for i in range(random.randint(14, 20)):
+            k = random.randrange(3)
+            _demo.append({"mac": "02:" + ":".join(f"{random.randrange(256):02x}" for _ in range(5)),
+                          "ssid": nets[k], "band": random.choice(bands[k]), "base": random.randint(-82, -38),
+                          "ip": f"192.168.1.{random.randint(20, 250)}", "mode": random.choice(["11AXA_HE160", "11BEA_EHT160", "11NG_HT20"]),
+                          "name": f"{kinds[i % len(kinds)]}-{i + 1}" if random.random() > .15 else "", "me": i == 0})
+        _demo.append({"ssids": {n: b for n, b in zip(nets, bands)}})
+    devs = []
+    for d in _demo[:-1]:
+        r = d["base"] + random.randint(-3, 3)
+        devs.append({**{k: v for k, v in d.items() if k != "base"}, "rssi": r, "rmin": r - 4, "rmax": r + 3,
+                     "tx": f"{random.randint(100, 2400)}M", "rx": f"{random.randint(100, 2400)}M", "since": "01:23:45"})
+    return {"ssids": _demo[-1]["ssids"], "devices": devs, "time": time.strftime("%H:%M:%S")}
+
+
+def get_data():
+    if DEMO:
+        return demo_data()
+    with lock:
+        if time.time() - cache["t"] > 2.5 or cache["data"] is None:
+            try:
+                cache["data"] = fetch()
+            except Exception as e:
+                cache["data"] = {"error": str(e), "ssids": {}, "devices": []}
+            cache["t"] = time.time()
+        return cache["data"]
+
+
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        global last_hit
+        path = self.path.split("?")[0]
+        if TOKEN:
+            if not path.startswith(f"/{TOKEN}/"):
+                self.send_error(404)
+                return
+            path = path[len(TOKEN) + 1:]
+        last_hit = time.time()
+        if path.startswith("/data"):
+            body, ctype = json.dumps(get_data()).encode(), "application/json"
+        elif path.startswith("/ausrichten"):
+            body, ctype = AUSRICHTEN.encode(), "text/html; charset=utf-8"
+        else:
+            body, ctype = PAGE.encode(), "text/html; charset=utf-8"
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def port_in_use():
+    with socket.socket() as s:
+        return s.connect_ex(("127.0.0.1", LAN_PORT if LAN else PORT)) == 0
+
+
+def lan_token():
+    try:
+        return open(TOKEN_FILE).read().strip()
+    except OSError:
+        import secrets
+        os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
+        t = secrets.token_urlsafe(9)
+        with open(os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT, 0o600), "w") as f:
+            f.write(t)
+        return t
+
+
+def lan_ip():
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.connect((ROUTER_IP, 9))
+        return s.getsockname()[0]
+
+
+TOKEN = lan_token() if LAN else ""
+
+
+def serve():
+    srv = http.server.ThreadingHTTPServer(("0.0.0.0", LAN_PORT) if LAN else ("127.0.0.1", PORT), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    while time.time() - last_hit < (LAN_IDLE if LAN else IDLE_EXIT):
+        time.sleep(5)
+    srv.shutdown()
+
+
+PAGE = r'''<!doctype html>
+<html lang="de"><head><meta charset="utf-8">
+<title>WLAN-Graph</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root{--bg:#1e1e1e;--panel:#262626;--fg:#dcddde;--dim:#8a8a8a;--line:#3f3f3f;--accent:#a88bfa;
+      --good:#4ade80;--ok:#facc15;--bad:#f87171;--b24:#fb923c;--b5:#38bdf8;--b6:#c084fc}
+@media (prefers-color-scheme: light){:root:not([data-theme="dark"]){--bg:#f6f6f6;--panel:#fff;--fg:#222;--dim:#777;--line:#d4d4d4;--accent:#7c3aed}}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:13px/1.4 system-ui,sans-serif;overflow:hidden}
+canvas{display:block;width:100vw;height:100vh;cursor:grab;touch-action:none}
+canvas.drag{cursor:grabbing}
+#top{position:fixed;top:12px;left:16px;right:16px;display:flex;gap:16px;align-items:baseline;pointer-events:none}
+#top h1{font-size:15px;margin:0;font-weight:600}
+#top span{color:var(--dim)}
+#top a{color:var(--accent);pointer-events:auto;margin-left:auto;text-decoration:none}
+#legend{position:fixed;left:16px;bottom:14px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:8px 12px;color:var(--dim);max-width:calc(100vw - 64px)}
+#legend b{color:var(--fg);font-weight:500}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin:0 4px 0 10px;vertical-align:-1px}
+#tip{position:fixed;pointer-events:none;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:8px 11px;display:none;min-width:190px;box-shadow:0 6px 20px #0006}
+#tip h3{margin:0 0 4px;font-size:13px}
+#tip div{display:flex;justify-content:space-between;gap:14px;color:var(--dim)}
+#tip div b{color:var(--fg);font-weight:500}
+#err{position:fixed;top:40px;left:16px;color:var(--bad)}
+</style></head><body>
+<canvas id="c"></canvas>
+<div id="top"><h1>WLAN-Graph</h1><span id="info">lade …</span><a href="ausrichten">Antenne ausrichten →</a></div>
+<div id="err"></div>
+<div id="legend"><b>Abstand zur Mitte = Empfang</b> · Ringe in dBm, innen = gut
+  <span class="dot" style="background:var(--b24)"></span>2,4 GHz
+  <span class="dot" style="background:var(--b5)"></span>5 GHz
+  <span class="dot" style="background:var(--b6)"></span>6 GHz
+  · <span style="color:var(--good)">gut</span> / <span style="color:var(--ok)">mittel</span> / <span style="color:var(--bad)">schlecht</span>
+  · Zoom per Rad/2 Finger, Doppelklick = einpassen</div>
+<div id="tip"></div>
+<script>
+// Radar-Ansicht: Router in der Mitte, Abstand zur Mitte = Signalstärke (Ringe in dBm),
+// jedes WLAN bekommt einen Kuchenstück-Sektor. Alle WLANs kommen vom selben Router,
+// darum zählt nur der Abstand zur Mitte.
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+let W, H, dpr;
+function resize(){ dpr = devicePixelRatio||1; W = innerWidth; H = innerHeight; cv.width = W*dpr; cv.height = H*dpr; }
+addEventListener('resize', resize); resize();
+
+const nodes = new Map();   // id -> {x, y, tx, ty, ...}
+let sectors = [], DATA = null, OUTER = -70;
+const view = {x:0, y:0, k:1};
+let auto = true;           // Ansicht automatisch einpassen, bis man selbst zoomt/verschiebt
+let hover = null, panning = null;
+
+const R_IN = 70, PX_DB = 8, DB_TOP = -30, DB_LOW = -90;  // -30 dBm = Innenkreis, je dB 8 px nach außen
+const rad = r => R_IN + (DB_TOP - Math.max(DB_LOW, Math.min(DB_TOP, r))) * PX_DB;
+const RINGS = [-40, -50, -60, -70, -80, -90];
+const HUB_R = 42;
+const quality = r => r >= -60 ? css('--good') : r >= -70 ? css('--ok') : css('--bad');
+const bandCol = b => css(b==='2.4' ? '--b24' : b==='5' ? '--b5' : '--b6');
+const devLabel = dv => dv.me ? (dv.name||'dieser PC')+' (du)' : dv.name || (dv.ip ? '.'+dv.ip.split('.').pop() : dv.mac.slice(-8));
+
+function place(id, init, tx, ty){
+  let n = nodes.get(id);
+  if (!n){ n = {x:tx*0.3, y:ty*0.3}; nodes.set(id, n); }
+  Object.assign(n, init, {tx, ty, seen:gen}); return n;
+}
+let gen = 0;
+
+async function load(){
+  try{
+    const d = await (await fetch('data')).json();
+    document.getElementById('err').textContent = d.error ? 'Fehler: '+d.error : '';
+    DATA = d; gen++;
+    place('router', {type:'router', label:'Router', r:12}, 0, 0);
+    const names = [...new Set([...Object.keys(d.ssids), ...d.devices.map(x=>x.ssid)])].sort();
+    const by = Object.fromEntries(names.map(s => [s, d.devices.filter(x=>x.ssid===s).sort((a,b)=>a.mac<b.mac?-1:1)]));
+    // Sektorbreite nach Geräteanzahl, leere WLANs bekommen ein schmales Stück
+    const wt = s => Math.max(0.7, by[s].length), tot = names.reduce((a,s)=>a+wt(s), 0);
+    let a0 = -Math.PI/2 - Math.PI*wt(names[0])/tot;   // erstes WLAN mittig oben
+    sectors = names.map(s => { const w = 2*Math.PI*wt(s)/tot, sec = {s, a0, a1:a0+w}; a0 += w; return sec; });
+    for (const sec of sectors){
+      const am = (sec.a0+sec.a1)/2, list = by[sec.s];
+      place('ssid:'+sec.s, {type:'hub', label:sec.s, sub:(d.ssids[sec.s]||[]).map(b=>b+' GHz').join(' · '), r:7, ssid:sec.s, count:list.length},
+            Math.cos(am)*HUB_R, Math.sin(am)*HUB_R);
+      list.forEach((dv, i) => {
+        const a = sec.a0 + (sec.a1-sec.a0)*(i+0.5)/list.length, r = rad(dv.rssi);
+        place('dev:'+dv.mac, {type:'dev', label:devLabel(dv), dev:dv, r: dv.me ? 7 : 5, hub:'ssid:'+sec.s}, Math.cos(a)*r, Math.sin(a)*r);
+      });
+    }
+    for (const [id, n] of nodes) if (n.seen !== gen) nodes.delete(id);
+    OUTER = Math.max(DB_LOW, Math.min(-70, Math.floor((Math.min(0, ...d.devices.map(x=>x.rssi)) - 1) / 10) * 10));
+    document.getElementById('info').textContent = `${d.devices.length} Geräte · ${names.length} Netze · Stand ${d.time} · alle 3 s`;
+  }catch(e){ document.getElementById('err').textContent = 'Keine Verbindung zum Server'; }
+}
+load(); setInterval(load, 3000);
+
+// Ansicht so einpassen, dass das schwächste Gerät samt Beschriftung sichtbar ist
+function fit(){
+  if (!auto) return;
+  const ext = rad(OUTER) + 6;   // WLAN-Namen stehen innen am Rand
+  const top = document.getElementById('top').getBoundingClientRect().bottom + 8;
+  const bot = H - document.getElementById('legend').getBoundingClientRect().top + 8;
+  const k = Math.min((W-24)/(2*ext+120), (H-top-bot)/(2*ext));   // seitlich Platz für WLAN-Namen
+  view.k += (k - view.k)*0.2; view.x += (0 - view.x)*0.2; view.y += ((top-bot)/2 - view.y)*0.2;
+}
+
+function tick(){
+  for (const n of nodes.values()){ n.x += (n.tx-n.x)*0.12; n.y += (n.ty-n.y)*0.12; }
+  fit();
+}
+
+function draw(){
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.fillStyle = css('--bg'); ctx.fillRect(0,0,W,H);
+  ctx.translate(W/2+view.x, H/2+view.y); ctx.scale(view.k, view.k);
+  const fg=css('--fg'), dim=css('--dim'), acc=css('--accent'), line=css('--line'), px = 1/view.k;
+  const fs = s => `${s/Math.max(view.k,0.55)}px system-ui`;
+
+  // Güte-Zonen als zarte Ringe: grün bis -60, gelb bis -70, rot darüber
+  const TAU = Math.PI*2;
+  const zone = (r0, r1, col) => {
+    r1 = Math.max(r1, OUTER); if (r0 <= r1) return;
+    ctx.globalAlpha = 0.08; ctx.fillStyle = col; ctx.beginPath();
+    ctx.arc(0,0,rad(r1),0,TAU); ctx.moveTo(rad(r0),0); ctx.arc(0,0,rad(r0),TAU,0,true); ctx.fill();
+  };
+  ctx.globalAlpha = 0.08; ctx.fillStyle = css('--good'); ctx.beginPath(); ctx.arc(0,0,rad(-60),0,TAU); ctx.fill();
+  zone(-60, -70, css('--ok')); zone(-70, DB_LOW, css('--bad'));
+  ctx.globalAlpha = 1;
+  // dBm-Ringe mit Beschriftung
+  ctx.strokeStyle = line; ctx.lineWidth = px; ctx.setLineDash([4*px, 4*px]);
+  for (const r of RINGS) if (r >= OUTER){ ctx.beginPath(); ctx.arc(0,0,rad(r),0,Math.PI*2); ctx.stroke(); }
+  ctx.setLineDash([]);
+  ctx.fillStyle = dim; ctx.font = fs(10); ctx.textAlign = 'left';
+  for (const r of RINGS) if (r >= OUTER){ const a = -Math.PI/4, rr = rad(r); ctx.fillText(r+' dBm', Math.cos(a)*rr+3*px, Math.sin(a)*rr-3*px); }
+  // Sektorgrenzen
+  ctx.strokeStyle = line; ctx.globalAlpha = 0.6;
+  for (const s of sectors){ ctx.beginPath(); ctx.moveTo(Math.cos(s.a0)*R_IN*0.8, Math.sin(s.a0)*R_IN*0.8); ctx.lineTo(Math.cos(s.a0)*rad(OUTER), Math.sin(s.a0)*rad(OUTER)); ctx.stroke(); }
+  ctx.globalAlpha = 1;
+
+  // beim Zeigen: Gerät + sein WLAN bzw. WLAN + seine Geräte hervorheben
+  const on = n => !hover || n.type==='router' || n===hover || (hover.type==='dev' && 'ssid:'+n.ssid===hover.hub) || (hover.type==='hub' && n.hub==='ssid:'+hover.ssid);
+
+  // Linien WLAN -> Gerät, Farbe = Empfang
+  for (const n of nodes.values()){
+    if (n.type!=='dev') continue;
+    const h = nodes.get(n.hub); if (!h) continue;
+    ctx.globalAlpha = on(n) ? 0.7 : 0.1; ctx.strokeStyle = quality(n.dev.rssi); ctx.lineWidth = 1.2*px;
+    ctx.beginPath(); ctx.moveTo(h.x,h.y); ctx.lineTo(n.x,n.y); ctx.stroke();
+  }
+  // Punkte und Beschriftungen
+  for (const n of nodes.values()){
+    ctx.globalAlpha = on(n) ? 1 : 0.2;
+    const col = n.type==='router' ? fg : n.type==='hub' ? acc : bandCol(n.dev.band);
+    if (n.dev && n.dev.me){ ctx.strokeStyle=fg; ctx.lineWidth=2*px; ctx.beginPath(); ctx.arc(n.x,n.y,n.r+4,0,7); ctx.stroke(); }
+    ctx.fillStyle = col; ctx.beginPath(); ctx.arc(n.x,n.y,n===hover?n.r+2:n.r,0,7); ctx.fill();
+    ctx.textAlign = 'center';
+    if (n.type==='dev'){
+      ctx.fillStyle = fg; ctx.font = fs(11); n.lx = n.x; n.ly = n.y+n.r+13/Math.max(view.k,0.55) - 4*px; n.lw = ctx.measureText(n.label).width;
+      ctx.fillText(n.label, n.x, n.y+n.r+13/Math.max(view.k,0.55));
+    } else if (n.type==='hub'){
+      // WLAN-Name innen am äußeren Rand des Sektors, Punkt innen am Router
+      const a = Math.atan2(n.ty, n.tx), rr = R_IN*0.62;
+      ctx.fillStyle = fg; ctx.font = '600 '+fs(12); n.lx = Math.cos(a)*(rad(OUTER)-24*px); n.ly = Math.sin(a)*(rad(OUTER)-24*px)+4*px; n.lw = Math.max(ctx.measureText(n.label).width, 60*px);
+      ctx.fillText(n.label, Math.cos(a)*(rad(OUTER)-24*px), Math.sin(a)*(rad(OUTER)-24*px)-2*px);
+      ctx.fillStyle = dim; ctx.font = fs(10); ctx.fillText(`${n.count} · ${n.sub}`, Math.cos(a)*(rad(OUTER)-24*px), Math.sin(a)*(rad(OUTER)-24*px)+11*px);
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+(function loop(){ tick(); draw(); requestAnimationFrame(loop); })();
+
+const toWorld = (mx,my) => [(mx-W/2-view.x)/view.k, (my-H/2-view.y)/view.k];
+// Trefferprüfung in Bildschirm-Pixeln: Punkt oder Beschriftung; mit dem Finger großzügiger
+function pick(mx, my, tol = 12){
+  let best = null, bd = 1e9;
+  for (const n of nodes.values()){
+    if (n.type === 'router') continue;
+    const sx = W/2 + view.x + n.x*view.k, sy = H/2 + view.y + n.y*view.k;
+    // WLAN-Punkte in der Mitte liegen zu eng: WLANs nur über ihren Namen, Geräte haben Vorrang
+    let d = n.type === 'hub' ? 1e9 : Math.hypot(sx-mx, sy-my) - n.r*view.k;
+    if (n.lx !== undefined){
+      const lx = W/2 + view.x + n.lx*view.k, ly = H/2 + view.y + n.ly*view.k, hw = n.lw*view.k/2 + 4;
+      const dx = Math.max(0, Math.abs(mx-lx) - hw), dy = Math.max(0, Math.abs(my-ly) - 9);
+      d = Math.min(d, Math.hypot(dx, dy) + (n.type === 'hub' ? 10 : 0));
+    }
+    if (d < tol && d < bd){ bd = d; best = n; }
+  }
+  return best;
+}
+const tip = document.getElementById('tip');
+function showTip(n, mx, my){
+  if (!n || n.type==='router'){ tip.style.display='none'; return; }
+  let h;
+  if (n.type==='hub'){
+    h = `<h3>${n.label}</h3><div>Bänder<b>${n.sub||'–'}</b></div><div>Geräte<b>${n.count}</b></div>`;
+  } else {
+    const d=n.dev, q = d.rssi>=-50?'hervorragend':d.rssi>=-60?'sehr gut':d.rssi>=-67?'gut':d.rssi>=-72?'ok':d.rssi>=-80?'schwach':'schlecht';
+    h = `<h3>${n.label}</h3>
+      <div>Signal<b style="color:${quality(d.rssi)}">${d.rssi} dBm · ${q}</b></div>
+      ${d.rmin!=null?`<div>min / max<b>${d.rmin} / ${d.rmax} dBm</b></div>`:''}
+      <div>Netz<b>${d.ssid} · ${d.band} GHz</b></div>
+      <div>Rate ↓ / ↑<b>${d.tx} / ${d.rx}</b></div>
+      <div>Standard<b>${d.mode}</b></div>
+      <div>IP<b>${d.ip||'–'}</b></div><div>MAC<b>${d.mac}</b></div>
+      <div>verbunden seit<b>${d.since}</b></div>`;
+  }
+  tip.innerHTML=h; tip.style.display='block';
+  const r=tip.getBoundingClientRect();
+  tip.style.left=Math.max(8, Math.min(mx+14, W-r.width-8))+'px'; tip.style.top=Math.max(8, Math.min(my+14, H-r.height-8))+'px';
+}
+
+// Maus: zeigen = Details, ziehen = verschieben, Rad = Zoom, Doppelklick = wieder einpassen
+cv.addEventListener('mousemove', e=>{
+  if (panning){ view.x=panning.vx+e.clientX-panning.x; view.y=panning.vy+e.clientY-panning.y; return; }
+  hover = pick(e.clientX,e.clientY); showTip(hover,e.clientX,e.clientY);
+  cv.style.cursor = hover ? 'pointer' : 'grab';
+});
+cv.addEventListener('mousedown', e=>{ auto=false; panning={x:e.clientX,y:e.clientY,vx:view.x,vy:view.y}; cv.classList.add('drag'); });
+addEventListener('mouseup', ()=>{ panning=null; cv.classList.remove('drag'); });
+cv.addEventListener('mouseleave', ()=>{ hover=null; tip.style.display='none'; });
+cv.addEventListener('dblclick', ()=>{ auto=true; });
+cv.addEventListener('wheel', e=>{
+  e.preventDefault(); auto=false;
+  const k2=Math.min(6,Math.max(0.15,view.k*Math.exp(-e.deltaY*0.0015)));
+  const mx=e.clientX-W/2, my=e.clientY-H/2;
+  view.x = mx-(mx-view.x)*k2/view.k; view.y = my-(my-view.y)*k2/view.k; view.k=k2;
+}, {passive:false});
+
+// Handy: antippen = Details, 1 Finger = verschieben, 2 Finger = Zoom, Doppeltippen = wieder einpassen
+let pinch = null, lastTap = 0, moved = false;
+cv.addEventListener('touchstart', e=>{
+  e.preventDefault();
+  const t = e.touches; moved = false;
+  if (t.length === 1){
+    panning = {x:t[0].clientX, y:t[0].clientY, vx:view.x, vy:view.y};
+  } else if (t.length === 2){
+    panning = null; auto = false;
+    pinch = {d:Math.hypot(t[0].clientX-t[1].clientX, t[0].clientY-t[1].clientY), k:view.k, vx:view.x, vy:view.y,
+             mx:(t[0].clientX+t[1].clientX)/2 - W/2, my:(t[0].clientY+t[1].clientY)/2 - H/2};
+  }
+}, {passive:false});
+cv.addEventListener('touchmove', e=>{
+  e.preventDefault();
+  const t = e.touches;
+  if (pinch && t.length === 2){
+    const k2 = Math.min(6, Math.max(0.15, pinch.k * Math.hypot(t[0].clientX-t[1].clientX, t[0].clientY-t[1].clientY) / pinch.d));
+    view.x = pinch.mx - (pinch.mx - pinch.vx) * k2 / pinch.k; view.y = pinch.my - (pinch.my - pinch.vy) * k2 / pinch.k; view.k = k2;
+  } else if (t.length === 1 && panning){
+    const dx = t[0].clientX-panning.x, dy = t[0].clientY-panning.y;
+    if (Math.hypot(dx,dy) > 10){ moved = true; auto = false; }
+    if (moved){ view.x=panning.vx+dx; view.y=panning.vy+dy; }
+  }
+}, {passive:false});
+cv.addEventListener('touchend', e=>{
+  if (!e.touches.length){
+    if (panning && !moved){
+      const now = Date.now();
+      if (now - lastTap < 300) auto = true;
+      lastTap = now;
+      hover = pick(panning.x, panning.y, 28); showTip(hover, panning.x, panning.y);
+    }
+    panning=null; pinch=null;
+  }
+});
+</script></body></html>
+'''
+
+# Antenne ausrichten: Kerze pro Position, besser/schlechter, Topscore (Daten bleiben im Browser)
+AUSRICHTEN = r'''<!doctype html>
+<html lang="de"><head><meta charset="utf-8">
+<title>Antenne ausrichten</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root{--bg:#1e1e1e;--panel:#262626;--fg:#dcddde;--dim:#8a8a8a;--line:#3f3f3f;--accent:#a88bfa;
+      --good:#4ade80;--ok:#facc15;--bad:#f87171;--top:#fbbf24;--b24:#fb923c;--b5:#38bdf8;--b6:#c084fc}
+@media (prefers-color-scheme: light){:root:not([data-theme="dark"]){--bg:#f6f6f6;--panel:#fff;--fg:#222;--dim:#777;--line:#d4d4d4;--accent:#7c3aed;--top:#d97706;--good:#16a34a;--ok:#ca8a04;--bad:#dc2626}}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.4 system-ui,sans-serif}
+main{max-width:1000px;margin:0 auto;padding:12px 16px 40px}
+header{display:flex;gap:12px;align-items:baseline;flex-wrap:wrap}
+header h1{font-size:16px;margin:0;font-weight:600}
+header span{color:var(--dim)}
+header a{color:var(--accent);margin-left:auto;text-decoration:none}
+#err{color:var(--bad);min-height:1.2em}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-top:10px}
+#status{display:grid;grid-template-columns:1fr auto;gap:6px 16px;align-items:center}
+#pos{font:600 17px system-ui;background:transparent;color:var(--fg);border:1px solid transparent;border-radius:6px;padding:2px 4px;margin-left:-5px;width:100%}
+#pos:hover,#pos:focus{border-color:var(--line);outline:none}
+#verdict{font:800 30px/1.1 system-ui;letter-spacing:.5px}
+#verdict.up{color:var(--good)} #verdict.down{color:var(--bad)} #verdict.same,#verdict.wait{color:var(--dim)}
+#big{text-align:right;grid-row:span 3}
+#big b{font:800 40px/1 system-ui;display:block}
+#big small{color:var(--dim)}
+.sub{color:var(--dim)}
+.sub b{color:var(--fg);font-weight:600}
+#topline{color:var(--top)}
+#flash{color:var(--top);font-weight:800;display:none}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px}
+button{font:600 14px system-ui;border:1px solid var(--line);background:var(--panel);color:var(--fg);border-radius:8px;padding:8px 12px;cursor:pointer}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-size:16px;padding:12px 18px}
+button.on{border-color:var(--accent);color:var(--accent)}
+button.warn{color:var(--bad)}
+.grp{display:flex;gap:4px;align-items:center}
+.grp span{color:var(--dim);margin-right:2px}
+.grp button{padding:5px 9px;font-weight:500}
+#chartbox{position:relative}
+canvas{display:block;width:100%;height:280px}
+#ctip{position:absolute;pointer-events:none;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:6px 9px;display:none;font-size:12px;white-space:nowrap;box-shadow:0 6px 20px #0006}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+th,td{padding:5px 6px;text-align:right;border-bottom:1px solid var(--line)}
+th{color:var(--dim);font-weight:500}
+th:first-child,td:first-child{text-align:left}
+td.n{max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+.p{color:var(--good)} .m{color:var(--bad)} .z{color:var(--dim)}
+.help{color:var(--dim);font-size:12px;margin-top:8px}
+.cardhead{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:6px}
+.cardhead b{font-weight:600}
+.cardhead button{margin-left:auto;padding:5px 10px;font-weight:500}
+#map{height:340px;cursor:pointer;touch-action:manipulation}
+tr.sel td:first-child{font-weight:700}
+tr.off td{opacity:.4}
+tbody tr{cursor:pointer}
+@media (max-width:560px){#verdict{font-size:24px}#big b{font-size:32px}canvas{height:230px}#map{height:300px}.hide-s{display:none}}
+</style></head><body><main>
+<header><h1>Antenne ausrichten</h1><span id="info">lade …</span><a href="./">← WLAN-Graph</a></header>
+<div id="err"></div>
+
+<section class="card" id="status">
+  <input id="pos" spellcheck="false" title="Namen der Position ändern, z. B. „links 45°“">
+  <div id="big"><b id="score">–</b><small id="scorelbl">Score</small></div>
+  <div id="verdict" class="wait">misst …</div>
+  <div class="sub" id="detail"></div>
+  <div class="sub"><span id="topline"></span> <span id="flash">★ NEUER TOPSCORE</span></div>
+</section>
+
+<div class="row">
+  <button class="primary" id="next" title="Leertaste">Antenne bewegt → neue Position</button>
+  <button id="redo" title="Messung dieser Position neu starten">neu messen</button>
+  <button id="reset" class="warn">alles löschen</button>
+</div>
+<div class="row">
+  <div class="grp" id="bands"><span>Band</span></div>
+  <div class="grp" id="metrics"><span>Wert</span></div>
+</div>
+
+<section class="card">
+  <div class="cardhead"><b>Karte</b><span class="sub" id="selinfo"></span><button id="selall">alle Geräte</button></div>
+  <canvas id="map"></canvas>
+</section>
+
+<section class="card">
+  <div id="chartbox"><canvas id="c"></canvas><div id="ctip"></div></div>
+  <div class="help">Eine Kerze pro Position: Docht = schlechtester bis bester Messwert, Körper = mittlere Hälfte, Strich = Median, Punkt = gerade jetzt.
+    Grün/Rot = besser/schlechter als die Position davor. ★ = Topscore. Die ersten 6 s nach dem Umstellen zählen nicht (Router mittelt nach).</div>
+</section>
+
+<section class="card">
+  <table><thead><tr><th>Gerät</th><th class="hide-s">Band</th><th>jetzt</th><th>Δ davor</th><th>Δ Top</th></tr></thead><tbody id="devs"></tbody></table>
+  <div class="help">Δ = Median-Signal dieser Position minus Median der Vergleichsposition (dB, + ist besser). Verglichen werden nur Geräte, die in beiden Positionen da waren. Zeile antippen = Gerät wählen.</div>
+</section>
+</main>
+<script>
+const KEY = 'wlan-ausrichten-v1', SETTLE = 6000, MAXS = 600;
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const $ = id => document.getElementById(id);
+const BANDS = [['alle','alle'],['2.4','2,4'],['5','5'],['6','6']];
+const METRICS = {
+  score: {lbl:'Score', desc:'Score 0–100 (−50 dBm = 100, −85 dBm = 0, Ø aller Geräte)', f: v => v.reduce((a,r)=>a+Math.max(0,Math.min(1,(r+85)/35)),0)/v.length*100, fmt: x => x.toFixed(0)},
+  good:  {lbl:'Geräte gut', desc:'Geräte mit gutem Signal (≥ −60 dBm)', f: v => v.filter(r=>r>=-60).length, fmt: x => x.toFixed(x%1?1:0)},
+  dbm:   {lbl:'Ø dBm', desc:'Durchschnitt aller Geräte in dBm', f: v => v.reduce((a,r)=>a+r,0)/v.length, fmt: x => x.toFixed(1)},
+};
+
+const newSeg = n => ({name:'Position '+n, t0:Date.now(), samples:[]});
+let S;
+try { S = JSON.parse(localStorage.getItem(KEY)); } catch(e) {}
+if (!S || !S.segs || !S.segs.length) S = {segs:[newSeg(1)], band:'alle', metric:'good', names:{}, n:1};
+S.sel ||= [];   // gewählte Geräte (MACs); leer = alle zählen
+const save = () => { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch(e) {} };
+const cur = () => S.segs[S.segs.length-1];
+let lastTime = null, lastData = null, wasTop = null, flashUntil = 0;
+
+const devLabel = dv => dv.me ? (dv.name||'dieser PC')+' (du)' : dv.name || (dv.ip ? '.'+dv.ip.split('.').pop() : dv.mac.slice(-8));
+const keyOK = k => (S.band === 'alle' || k.endsWith('|'+S.band)) && (!S.sel.length || S.sel.includes(k.split('|')[0]));
+const bandOK = k => S.band === 'alle' || k.endsWith('|'+S.band);
+function toggle(mac){ const i = S.sel.indexOf(mac); i < 0 ? S.sel.push(mac) : S.sel.splice(i, 1); wasTop = null; save(); render(); }
+const quality = r => r >= -60 ? css('--good') : r >= -70 ? css('--ok') : css('--bad');
+const bandCol = b => css(b==='2.4' ? '--b24' : b==='5' ? '--b5' : '--b6');
+
+// ---------- Auswertung
+const q = (s, p) => { const i = (s.length-1)*p, lo = Math.floor(i); return s[lo] + (s[Math.min(lo+1, s.length-1)] - s[lo])*(i-lo); };
+const settled = seg => seg.samples.filter(x => x.t - seg.t0 >= SETTLE);
+function sampleVal(x){
+  const v = Object.entries(x.d).filter(([k]) => keyOK(k)).map(([,r]) => r);
+  return v.length ? METRICS[S.metric].f(v) : null;
+}
+function candle(seg){
+  const v = settled(seg).map(sampleVal).filter(x => x !== null).sort((a,b)=>a-b);
+  if (!v.length) return null;
+  return {lo:v[0], hi:v[v.length-1], q1:q(v,.25), med:q(v,.5), q3:q(v,.75), n:v.length};
+}
+function devMed(seg){
+  const acc = {};
+  for (const x of settled(seg)) for (const [k,r] of Object.entries(x.d)) if (keyOK(k)) (acc[k] ||= []).push(r);
+  const out = {};
+  for (const [k,v] of Object.entries(acc)){ v.sort((a,b)=>a-b); out[k] = q(v,.5); }
+  return out;
+}
+// fairer Vergleich: nur Geräte, die in beiden Positionen gemessen wurden
+function compare(a, b){
+  const A = devMed(a), B = devMed(b), ks = Object.keys(A).filter(k => k in B);
+  if (!ks.length) return null;
+  const d = ks.map(k => A[k]-B[k]);
+  return {dd: d.reduce((s,x)=>s+x,0)/d.length, n: ks.length, up: d.filter(x=>x>=2).length, down: d.filter(x=>x<=-2).length,
+          goodA: ks.filter(k=>A[k]>=-60).length, goodB: ks.filter(k=>B[k]>=-60).length};
+}
+const MIN_N = 3;   // so viele ausgewertete Messungen braucht eine Position, bevor sie zählt
+function topIdx(cs){
+  let best = -1;
+  cs.forEach((c,i) => { if (c && c.n >= MIN_N && (best < 0 || c.med > cs[best].med)) best = i; });
+  return best;
+}
+
+// ---------- Messen
+async function poll(){
+  try{
+    const d = await (await fetch('data', {cache:'no-store'})).json();
+    $('err').textContent = d.error ? 'Fehler: '+d.error : '';
+    lastData = d;
+    if (!d.error && d.time !== lastTime){
+      lastTime = d.time;
+      const x = {t: Date.now(), d: {}};
+      for (const dv of d.devices){ const k = dv.mac+'|'+dv.band; x.d[k] = dv.rssi; S.names[k] = devLabel(dv); }
+      const seg = cur(); seg.samples.push(x); if (seg.samples.length > MAXS) seg.samples.shift();
+      save();
+    }
+    $('info').textContent = `${d.devices.length} Geräte · Stand ${d.time}`;
+  }catch(e){ $('err').textContent = 'Keine Verbindung zum Server'; }
+  render();
+}
+
+// ---------- Anzeige
+function render(){
+  const M = METRICS[S.metric], seg = cur(), cs = S.segs.map(candle), ti = topIdx(cs), ci = S.segs.length-1;
+  if (document.activeElement !== $('pos')) $('pos').value = seg.name;
+  const wait = Math.ceil((SETTLE - (Date.now() - seg.t0))/1000);
+  const c = cs[ci];
+  $('scorelbl').textContent = M.lbl;
+  $('score').textContent = c ? M.fmt(c.med) : '–';
+  $('score').style.color = ti === ci ? css('--top') : '';
+
+  // Urteil gegenüber der letzten Position mit Daten
+  let pi = ci-1; while (pi >= 0 && !cs[pi]) pi--;
+  const v = $('verdict'); let detail = '';
+  if (wait > 0){ v.className = 'wait'; v.textContent = `ruhig halten … ${wait} s`; }
+  else if (!c || c.n < MIN_N){ v.className = 'wait'; v.textContent = 'misst …'; }
+  else if (pi < 0){ v.className = 'same'; v.textContent = 'Startwert'; detail = 'Jetzt Antenne bewegen und „neue Position“ drücken.'; }
+  else {
+    const cmp = compare(seg, S.segs[pi]);
+    const dm = c.med - cs[pi].med;
+    // entschieden wird über die Geräte, die in beiden Positionen da waren (Δ dB), nicht über Zu- und Abgänge
+    const dir = !cmp ? Math.sign(dm) : cmp.dd >= 1 ? 1 : cmp.dd <= -1 ? -1 : 0;
+    v.className = dir > 0 ? 'up' : dir < 0 ? 'down' : 'same';
+    v.textContent = dir > 0 ? '▲ BESSER' : dir < 0 ? '▼ SCHLECHTER' : '≈ GLEICH';
+    detail = `ggü. <b>${S.segs[pi].name}</b>: ${M.lbl} ${sign(dm, M.fmt)}`;
+    if (cmp) detail += ` · Ø <b>${cmp.dd>=0?'+':''}${cmp.dd.toFixed(1)} dB</b> · gut ${cmp.goodB} → <b>${cmp.goodA}</b> · ${cmp.up}× besser, ${cmp.down}× schlechter (von ${cmp.n})`;
+  }
+  $('detail').innerHTML = detail;
+
+  // Topscore
+  if (ti >= 0){
+    $('topline').textContent = ti === ci ? `★ Diese Position ist Topscore` : `★ Top: ${S.segs[ti].name} mit ${M.fmt(cs[ti].med)}`;
+    if (wasTop !== null && ti === ci && wasTop !== ci && S.segs.length > 1) flashUntil = Date.now() + 4000;
+    wasTop = ti;
+  } else $('topline').textContent = '';
+  $('flash').style.display = Date.now() < flashUntil ? 'inline' : 'none';
+
+  for (const b of $('bands').querySelectorAll('button')) b.classList.toggle('on', b.dataset.v === S.band);
+  for (const b of $('metrics').querySelectorAll('button')) b.classList.toggle('on', b.dataset.v === S.metric);
+  drawChart(cs, ti);
+  drawMap();
+  $('selinfo').textContent = S.sel.length ? `${S.sel.length} gewählt – nur diese zählen` : 'Geräte antippen, um nur diese zu werten – sonst zählen alle';
+  $('selall').style.display = S.sel.length ? '' : 'none';
+  table(ti, pi);
+}
+const sign = (x, f) => (x > 0 ? '+' : x < 0 ? '−' : '±') + f(Math.abs(x));
+
+function table(ti, pi){
+  const seg = cur(), last = seg.samples[seg.samples.length-1], A = devMed(seg);
+  const P = pi >= 0 ? devMed(S.segs[pi]) : {}, T = ti >= 0 && ti !== S.segs.length-1 ? devMed(S.segs[ti]) : {};
+  const rows = Object.entries(last ? last.d : {}).filter(([k]) => bandOK(k)).sort((a,b) => b[1]-a[1]);
+  const delta = (k, R) => {
+    if (!(k in A) || !(k in R)) return '<td class="z">–</td>';
+    const x = A[k]-R[k];
+    return `<td class="${x>=2?'p':x<=-2?'m':'z'}">${x>0?'+':''}${x.toFixed(0)}</td>`;
+  };
+  $('devs').innerHTML = rows.map(([k,r]) => {
+    const b = k.split('|')[1];
+    const mac = k.split('|')[0], cls = S.sel.length ? (S.sel.includes(mac) ? 'sel' : 'off') : '';
+    return `<tr class="${cls}" data-mac="${mac}"><td class="n">${cls==='sel'?'✓ ':''}<span class="dot" style="background:${bandCol(b)}"></span>${S.names[k]||k}</td>
+      <td class="hide-s">${b} GHz</td><td style="color:${quality(r)}">${r}</td>${delta(k,P)}${delta(k,T)}</tr>`;
+  }).join('') || '<tr><td colspan="5" class="z">noch keine Daten</td></tr>';
+}
+
+// ---------- Karte: Router in der Mitte, Abstand = Signal, ein Sektor pro WLAN (wie im WLAN-Graph)
+const mv = $('map'), mx = mv.getContext('2d');
+let mapHit = [];
+function drawMap(){
+  const dpr = devicePixelRatio || 1, W = mv.clientWidth, H = mv.clientHeight;
+  if (mv.width !== W*dpr || mv.height !== H*dpr){ mv.width = W*dpr; mv.height = H*dpr; }
+  mx.setTransform(dpr,0,0,dpr,0,0); mx.clearRect(0,0,W,H);
+  const devs = (lastData && lastData.devices || []).filter(dv => bandOK(dv.mac+'|'+dv.band));
+  mapHit = [];
+  const cx = W/2, cy = H/2, R = Math.min(W, H)/2 - 14, R0 = R*0.14;
+  const outer = Math.max(-90, Math.min(-70, Math.floor((Math.min(0, ...devs.map(d=>d.rssi)) - 1)/10)*10));
+  const rad = r => R0 + (R-R0) * (-30 - Math.max(outer, Math.min(-30, r))) / (-30 - outer);
+  const TAU = Math.PI*2, line = css('--line'), dim = css('--dim'), fg = css('--fg');
+  // Zonen grün / gelb / rot
+  const ring = (a, b, col) => { mx.globalAlpha = .09; mx.fillStyle = col; mx.beginPath(); mx.arc(cx,cy,rad(b),0,TAU); if (a < -30) { mx.moveTo(cx+rad(a),cy); mx.arc(cx,cy,rad(a),TAU,0,true); } mx.fill(); };
+  ring(-30, -60, css('--good')); ring(-60, -70, css('--ok')); if (outer < -70) ring(-70, outer, css('--bad'));
+  mx.globalAlpha = 1; mx.strokeStyle = line; mx.setLineDash([3,4]); mx.font = '10px system-ui'; mx.fillStyle = dim; mx.textAlign = 'left';
+  for (let r = -40; r >= outer; r -= 10){ mx.beginPath(); mx.arc(cx,cy,rad(r),0,TAU); mx.stroke(); mx.fillText(r, cx+rad(r)*0.71+3, cy-rad(r)*0.71-2); }
+  mx.setLineDash([]);
+  mx.fillStyle = fg; mx.beginPath(); mx.arc(cx,cy,6,0,TAU); mx.fill();
+  if (!devs.length){ mx.fillStyle = dim; mx.textAlign = 'center'; mx.fillText('keine Geräte', cx, cy+22); return; }
+  const names = [...new Set(devs.map(d => d.ssid))].sort();
+  const by = Object.fromEntries(names.map(n => [n, devs.filter(d => d.ssid === n).sort((a,b) => a.mac < b.mac ? -1 : 1)]));
+  const tot = devs.length; let a0 = -Math.PI/2 - Math.PI*by[names[0]].length/tot;
+  for (const n of names){
+    const w = TAU*by[n].length/tot, list = by[n];
+    mx.strokeStyle = line; mx.globalAlpha = .6; mx.beginPath(); mx.moveTo(cx+Math.cos(a0)*R0, cy+Math.sin(a0)*R0); mx.lineTo(cx+Math.cos(a0)*R, cy+Math.sin(a0)*R); mx.stroke(); mx.globalAlpha = 1;
+    const am = a0 + w/2; mx.fillStyle = dim; mx.font = '600 11px system-ui'; mx.textAlign = 'center';
+    mx.fillText(n, cx+Math.cos(am)*(R-10), cy+Math.sin(am)*(R-10)+4);
+    list.forEach((dv, i) => {
+      const a = a0 + w*(i+0.5)/list.length, r = rad(dv.rssi), x = cx+Math.cos(a)*r, y = cy+Math.sin(a)*r;
+      const on = S.sel.includes(dv.mac), faded = S.sel.length && !on;
+      mx.globalAlpha = faded ? .3 : 1;
+      if (on){ mx.strokeStyle = css('--accent'); mx.lineWidth = 3; mx.beginPath(); mx.arc(x,y,10,0,TAU); mx.stroke(); }
+      mx.fillStyle = bandCol(dv.band); mx.beginPath(); mx.arc(x,y,on?7:5,0,TAU); mx.fill();
+      if (dv.me){ mx.strokeStyle = fg; mx.lineWidth = 1.5; mx.beginPath(); mx.arc(x,y,8,0,TAU); mx.stroke(); }
+      mx.fillStyle = fg; mx.font = (on ? '700 ' : '') + '11px system-ui'; mx.textAlign = 'center';
+      mx.fillText(devLabel(dv), x, y+(on?22:17));
+      mx.globalAlpha = 1;
+      mapHit.push({x, y, mac: dv.mac});
+    });
+    a0 += w;
+  }
+}
+mv.addEventListener('click', e => {
+  const r = mv.getBoundingClientRect(), x = e.clientX - r.left, y = e.clientY - r.top;
+  let best = null, bd = 26;
+  for (const h of mapHit){ const d = Math.hypot(h.x-x, h.y-y); if (d < bd){ bd = d; best = h; } }
+  if (best) toggle(best.mac);
+});
+
+// ---------- Kerzen-Chart
+const cv = $('c'), ctx = cv.getContext('2d');
+let hit = [];
+function drawChart(cs, ti){
+  const dpr = devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
+  if (cv.width !== W*dpr || cv.height !== H*dpr){ cv.width = W*dpr; cv.height = H*dpr; }
+  ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,W,H);
+  const fg = css('--fg'), dim = css('--dim'), line = css('--line'), M = METRICS[S.metric];
+  const L = 44, R = 10, T = 18, B = 34;
+  // nur so viele Kerzen, wie hinpassen (die neuesten)
+  const fitN = Math.max(3, Math.floor((W-L-R)/30)), off = Math.max(0, cs.length - fitN), show = cs.slice(off);
+  const last = cur().samples[cur().samples.length-1], live = last ? sampleVal(last) : null;
+  const vals = show.filter(Boolean).flatMap(c => [c.lo, c.hi]); if (live !== null) vals.push(live);
+  if (!vals.length){ ctx.fillStyle = dim; ctx.font = '13px system-ui'; ctx.fillText('sammelt Messwerte …', L, H/2); hit = []; return; }
+  let lo = Math.min(...vals), hi = Math.max(...vals);
+  if (S.metric === 'good'){ lo = Math.max(0, Math.floor(lo)-1); hi = Math.ceil(hi)+1; }
+  else { const pad = Math.max((hi-lo)*0.15, S.metric === 'dbm' ? 2 : 3); lo -= pad; hi += pad; }
+  const y = v => T + (hi - v)/(hi - lo)*(H-T-B);
+  // Achse
+  ctx.font = '11px system-ui'; ctx.textAlign = 'right'; ctx.strokeStyle = line; ctx.lineWidth = 1;
+  const step = niceStep((hi-lo)/5, S.metric === 'good');
+  for (let v = Math.ceil(lo/step)*step; v <= hi; v += step){
+    ctx.globalAlpha = .6; ctx.beginPath(); ctx.moveTo(L, y(v)); ctx.lineTo(W-R, y(v)); ctx.stroke(); ctx.globalAlpha = 1;
+    ctx.fillStyle = dim; ctx.fillText(M.fmt(v), L-6, y(v)+4);
+  }
+  // Topscore-Linie
+  if (ti >= 0){
+    ctx.strokeStyle = css('--top'); ctx.setLineDash([5,4]); ctx.globalAlpha = .7;
+    ctx.beginPath(); ctx.moveTo(L, y(cs[ti].med)); ctx.lineTo(W-R, y(cs[ti].med)); ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha = 1;
+  }
+  const slot = Math.min(80, (W-L-R)/Math.max(show.length, 4)), bw = Math.max(8, Math.min(26, slot*0.5));
+  hit = [];
+  let prev = null; for (let i = off-1; i >= 0; i--) if (cs[i]){ prev = cs[i]; break; }
+  show.forEach((c, j) => {
+    const i = off + j, x = L + slot*(j+0.5), isCur = i === cs.length-1;
+    ctx.textAlign = 'center'; ctx.fillStyle = isCur ? fg : dim; ctx.font = (isCur ? '600 ' : '') + '11px system-ui';
+    ctx.fillText(short(S.segs[i].name, slot), x, H-B+16);
+    if (i === ti){ ctx.fillStyle = css('--top'); ctx.font = '700 12px system-ui'; ctx.fillText('★', x, H-B+30); }
+    if (!c){ ctx.strokeStyle = dim; ctx.setLineDash([3,3]); ctx.strokeRect(x-bw/2, T+4, bw, H-T-B-8); ctx.setLineDash([]); hit.push({x, i, c}); return; }
+    const col = !prev ? css('--accent') : c.med > prev.med + 1e-9 ? css('--good') : c.med < prev.med - 1e-9 ? css('--bad') : dim;
+    prev = c;
+    ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(x, y(c.hi)); ctx.lineTo(x, y(c.lo)); ctx.stroke();               // Docht
+    const top = y(c.q3), h = Math.max(2, y(c.q1) - top);
+    ctx.globalAlpha = .35; ctx.fillRect(x-bw/2, top, bw, h); ctx.globalAlpha = 1; ctx.strokeRect(x-bw/2, top, bw, h);  // Körper
+    ctx.lineWidth = 2.5; ctx.beginPath(); ctx.moveTo(x-bw/2, y(c.med)); ctx.lineTo(x+bw/2, y(c.med)); ctx.stroke();   // Median
+    if (i === ti){ ctx.strokeStyle = css('--top'); ctx.lineWidth = 2; ctx.strokeRect(x-bw/2-4, top-4, bw+8, h+8); }
+    hit.push({x, i, c});
+  });
+  // Live-Punkt auf der aktuellen Kerze
+  if (live !== null && cs.length - 1 >= off){
+    const x = L + slot*(cs.length-1-off+0.5);
+    ctx.fillStyle = fg; ctx.beginPath(); ctx.arc(x, y(live), 4.5, 0, 7); ctx.fill();
+    ctx.strokeStyle = css('--bg'); ctx.lineWidth = 1.5; ctx.stroke();
+  }
+}
+function niceStep(raw, int){
+  const p = Math.pow(10, Math.floor(Math.log10(raw || 1))), m = raw/p;
+  const s = (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * p;
+  return int ? Math.max(1, Math.round(s)) : s;
+}
+function short(s, w){ ctx.font = '11px system-ui'; if (ctx.measureText(s).width <= w-4) return s; const m = s.match(/(\d+)$/); return m ? '#'+m[1] : s.slice(0, Math.max(2, Math.floor(w/7)))+'…'; }
+
+cv.addEventListener('mousemove', e => showCTip(e.offsetX, e.offsetY));
+cv.addEventListener('mouseleave', () => $('ctip').style.display = 'none');
+cv.addEventListener('touchstart', e => { const r = cv.getBoundingClientRect(), t = e.touches[0]; showCTip(t.clientX-r.left, t.clientY-r.top); }, {passive:true});
+function showCTip(mx, my){
+  const h = hit.reduce((b, p) => Math.abs(p.x-mx) < Math.abs((b?.x ?? 1e9)-mx) ? p : b, null), tip = $('ctip');
+  if (!h || Math.abs(h.x-mx) > 40){ tip.style.display = 'none'; return; }
+  const f = METRICS[S.metric].fmt, c = h.c;
+  tip.innerHTML = `<b>${S.segs[h.i].name}</b><br>` + (c ? `Median ${f(c.med)} · Bereich ${f(c.lo)}–${f(c.hi)}<br>${c.n} Messungen` : 'noch keine Messwerte');
+  tip.style.display = 'block';
+  tip.style.left = Math.max(0, Math.min(mx+12, cv.clientWidth - tip.offsetWidth)) + 'px'; tip.style.top = Math.max(0, my-50) + 'px';
+}
+
+// ---------- Bedienung
+for (const [v, l] of BANDS){ const b = document.createElement('button'); b.dataset.v = v; b.textContent = l; b.onclick = () => { S.band = v; save(); render(); }; $('bands').append(b); }
+for (const [v, m] of Object.entries(METRICS)){ const b = document.createElement('button'); b.dataset.v = v; b.textContent = m.lbl; b.title = m.desc; b.onclick = () => { S.metric = v; wasTop = null; save(); render(); }; $('metrics').append(b); }
+function next(){ S.n = (S.n||S.segs.length) + 1; S.segs.push(newSeg(S.n)); save(); render(); }
+$('next').onclick = next;
+$('redo').onclick = () => { const s = cur(); s.samples = []; s.t0 = Date.now(); save(); render(); };
+let armed = 0;
+$('reset').onclick = () => {
+  if (Date.now() - armed > 3000){ armed = Date.now(); $('reset').textContent = 'wirklich? nochmal tippen'; setTimeout(() => $('reset').textContent = 'alles löschen', 3000); return; }
+  S = {segs:[newSeg(1)], band:S.band, metric:S.metric, names:{}, n:1}; wasTop = null; armed = 0; $('reset').textContent = 'alles löschen'; save(); render();
+};
+$('devs').addEventListener('click', e => { const tr = e.target.closest('tr[data-mac]'); if (tr) toggle(tr.dataset.mac); });
+$('selall').onclick = () => { S.sel = []; wasTop = null; save(); render(); };
+$('pos').addEventListener('input', e => { cur().name = e.target.value || 'Position'; save(); });
+$('pos').addEventListener('keydown', e => { if (e.key === 'Enter') e.target.blur(); });
+addEventListener('keydown', e => { if (e.code === 'Space' && document.activeElement.tagName !== 'INPUT'){ e.preventDefault(); next(); } });
+addEventListener('resize', render);
+
+poll(); setInterval(poll, 2500); setInterval(render, 1000);
+</script></body></html>
+'''
+
+if __name__ == "__main__":
+    if "--serve" in sys.argv:
+        serve()
+        sys.exit()
+    if not port_in_use():
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "--serve"] + [a for a in ("--lan", "--demo") if a in sys.argv],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        for _ in range(30):
+            if port_in_use():
+                break
+            time.sleep(0.1)
+    sub = "ausrichten" if "--ausrichten" in sys.argv else ""
+    if LAN:
+        url = f"http://{lan_ip()}:{LAN_PORT}/{TOKEN}/{sub}"
+        print(f"WLAN-Graph fürs Handy (läuft bis 1 h ohne Abruf):\n  {url}\n")
+        if subprocess.run(["which", "qrencode"], capture_output=True).returncode == 0:
+            subprocess.run(["qrencode", "-t", "ansiutf8", url])
+        sys.exit()
+    if "--no-open" not in sys.argv:
+        subprocess.Popen(["omarchy", "launch", "webapp", f"http://127.0.0.1:{PORT}/{sub}"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)

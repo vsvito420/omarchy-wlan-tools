@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Name=WLAN Paketverlust
+Comment=Paketverlust und Lag-Spitzen live (WLAN, Provider, Valve CS2)
+Exec=xdg-terminal-exec --app-id=TUI.tile -e @BIN@/wlan-loss
+Terminal=false
+Type=Application
+Icon=network-wireless
+StartupNotify=true

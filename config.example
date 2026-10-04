@@ -1,0 +1,8 @@
+# ~/.config/wlan-tools/config – alles optional
+# Router (ASUS mit Qualcomm-Treiber, SSH an, Schlüssel-Login)
+ROUTER_HOST=192.168.1.1        # leer = Standard-Gateway
+ROUTER_USER=admin
+ROUTER_PORT=22
+ROUTER_SCRIPT=/jffs/wifimon.sh # wo router/wifimon.sh auf dem Router liegt
+# nur für wlan-vergleich: Linux-Rechner per Kabel mit python3 (SSH-Schlüssel)
+SERVER=root@192.168.1.10
